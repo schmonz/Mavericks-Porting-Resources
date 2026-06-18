@@ -142,7 +142,7 @@ int main(int argc, char **argv) {
         lcp += cmdsize;
     }
 
-    if (new_off > first_sect_off) {
+    if (sizeof(struct mach_header_64) + new_off > first_sect_off) {
         fprintf(stderr, "ERROR: new LCs (%u bytes) don't fit in header pad (%u avail)\n",
                 new_off - (uint32_t)sizeof(struct mach_header_64), pad_avail);
         return 1;
