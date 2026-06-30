@@ -14,6 +14,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <stdio.h>     /* rename() in ophist_dump (else implicit-decl error on clang>=15) */
 #include <sys/mman.h>
 #include <pthread.h>
 #include <signal.h>
