@@ -88,6 +88,14 @@ echo "[6f] block-window relocation: round-trip emulate + verbatim + jmp-back..."
 # stops the build instead of being masked.
 AVXEMU_DISABLE=1 AVXEMU_FORCETRAMP=1 "$OUT/reloctest"
 
+echo "[6g] native-SSE codegen thunk: emitted block vs C emulate (differential oracle)..."
+"$CC" $CORE -c test/nativetest.c -o "$OUT/nativetest.o" 2>&1 | quiet
+"$CC" $CORE "$OUT/nativetest.o" $PURE $ASM -o "$OUT/nativetest"
+# Hermetic: the emitter and C emulator both consume `decoded` structs; no VEX is
+# executed. AVXEMU_DISABLE keeps the load-time constructor out (the test inits the
+# pool itself). No `| tail`, so a mismatch (set -e) stops the build.
+AVXEMU_DISABLE=1 "$OUT/nativetest"
+
 echo "[7] decoder + differential fuzzer vs the real Claude binary (if present)..."
 BINARY="${CLAUDE_BIN:-$HOME/.local/share/claude/versions/2.1.166}"
 if [ -f "$BINARY" ]; then

@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <pthread.h>
+#include <signal.h>
+#include <fcntl.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
@@ -36,12 +38,70 @@ extern char avxemu_tt2_dispatchptr[], avxemu_tt2_resumeptr[], avxemu_tt2_record[
 
 static void emit(const char *s){ (void)write(2, s, strlen(s)); }
 
+/* ============================================================================
+ * Milestone-B DIAGNOSTIC (env-gated; harmless when unset): execution-weighted
+ * histogram of which ops actually go through C emulation (i.e. are NOT native-
+ * codegen'd) during a run. AVXEMU_OPHIST=1 turns it on; dump on SIGUSR2 (so a
+ * live spinning process can be probed via `kill -USR2 <pid>`) and atexit. The
+ * dump goes to /tmp/ophist.out (parent-readable; the child's stderr is on a pty).
+ * ========================================================================== */
+static uint64_t g_ophist[VEX_OP_COUNT];
+static int g_ophist_on = -1;
+static int ophist_enabled(void){
+    if (g_ophist_on < 0){ const char *e = getenv("AVXEMU_OPHIST"); g_ophist_on = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return g_ophist_on;
+}
+/* async-signal-safe unsigned decimal writer */
+static void as_u64(int fd, uint64_t v){
+    char b[24]; int i = 24;
+    if (v == 0){ (void)write(fd, "0", 1); return; }
+    while (v){ b[--i] = (char)('0' + (v % 10)); v /= 10; }
+    (void)write(fd, b + i, (size_t)(24 - i));
+}
+/* async-signal-safe: open/write/close + strlen on static strings only, no malloc */
+static void ophist_dump_fd(int fd){
+    int idx[VEX_OP_COUNT]; int m = 0;
+    for (int i = 0; i < VEX_OP_COUNT; i++) if (g_ophist[i]) idx[m++] = i;
+    for (int i = 0; i < m; i++){ int best = i;
+        for (int j = i + 1; j < m; j++) if (g_ophist[idx[j]] > g_ophist[idx[best]]) best = j;
+        int t = idx[i]; idx[i] = idx[best]; idx[best] = t; }
+    static const char hdr[] = "=== AVXEMU_OPHIST: C-emulated op histogram (execution-weighted, desc) ===\n";
+    (void)write(fd, hdr, sizeof hdr - 1);
+    uint64_t total = 0;
+    for (int i = 0; i < m; i++){
+        const char *nm = vex_op_name((vex_op)idx[i]);
+        (void)write(fd, nm, strlen(nm)); (void)write(fd, "\t", 1);
+        as_u64(fd, g_ophist[idx[i]]); (void)write(fd, "\n", 1);
+        total += g_ophist[idx[i]];
+    }
+    (void)write(fd, "TOTAL\t", 6); as_u64(fd, total); (void)write(fd, "\n", 1);
+}
+/* atomic: write to a temp path then rename, so /tmp/ophist.out is never a partial
+ * file even if a kill -9 lands mid-dump (rename is atomic). */
+static void ophist_dump(void){
+    int fd = open("/tmp/ophist.out.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { ophist_dump_fd(2); return; }
+    ophist_dump_fd(fd);
+    close(fd);
+    (void)rename("/tmp/ophist.out.tmp", "/tmp/ophist.out");
+}
+static void ophist_sigusr2(int sig){ (void)sig; ophist_dump(); }
+/* Robust fallback: the host (Bun/JSC) may reinstall its own SIGUSR2 handler and a
+ * kill -9 skips atexit, so also snapshot to /tmp/ophist.out periodically from the
+ * hot path. O_TRUNC means the file always holds a recent cumulative snapshot. */
+static uint64_t g_ophist_total;
+#define OPHIST_SNAP_EVERY (1u << 17)
+static inline void ophist_tick(void){
+    if (((++g_ophist_total) & (OPHIST_SNAP_EVERY - 1)) == 0) ophist_dump();
+}
+
 /* The actual emulation, run on the side stack. */
 static void tramp_emulate_run(const void *recordp, void *rfp) {
     const run_record *r = (const run_record *)recordp;
     avxemu_regfile *rf = (avxemu_regfile *)rfp;
     for (uint32_t i = 0; i < r->n; i++) {
         rf->rip = r->insns[i].addr;
+        if (g_ophist_on) { g_ophist[r->insns[i].dec.op]++; ophist_tick(); }   /* AVXEMU_OPHIST diagnostic */
         if (!avxemu_emulate(&r->insns[i].dec, rf)) {
             /* Scanner only trampolines ops we emulate, so this is a bug net. */
             emit("avxemu: tramp dispatch: emulate failed mid-run\n");
@@ -101,6 +161,7 @@ static int emulate_bmi_reg(const decoded *d, avxemu_regfile *rf) {
 void avxemu_tramp_dispatch_bmi(const run_record *r, avxemu_regfile *rf) {
     for (uint32_t i = 0; i < r->n; i++) {
         rf->rip = r->insns[i].addr;
+        if (g_ophist_on) { g_ophist[r->insns[i].dec.op]++; ophist_tick(); }   /* AVXEMU_OPHIST diagnostic */
         if (!emulate_bmi_reg(&r->insns[i].dec, rf)) {
             emit("avxemu: tramp dispatch (bmi): emulate failed mid-run\n");
             return;
@@ -244,6 +305,440 @@ static void detect_features(void) {
 
 #define MAXRUN 64
 
+/* ============================================================================
+ * Milestone B: register-resident native-SSE codegen.
+ *
+ * For a run whose every instruction is one of a small set of dominant AVX2
+ * vector ops, instead of routing through avxemu_tramp_dispatch (a C call that
+ * loops avxemu_emulate per instruction), we EMIT a native straight-line SSE
+ * function `block(const run_record *r, avxemu_regfile *rf)` (same signature the
+ * tt template calls: rdi=run_record (unused here), rsi=&rf). The block reads
+ * each op's source operands out of the in-memory regfile (rf), computes the op
+ * with native SSE on the two 128-bit halves, and writes the result back into
+ * rf. The tt template's spill/reload/resume is unchanged — only the dispatch
+ * pointer is swapped from avxemu_tramp_dispatch to this emitted block.
+ *
+ * CORRECTNESS MODEL (write-through): every instruction's result is stored back
+ * to its rf ymm slot immediately, so the in-memory rf is the canonical register
+ * file and is up to date at every instruction boundary. Data dependencies
+ * within the run therefore resolve through rf automatically. As a register-
+ * residency optimisation for the dominant straight-line dependency chain, the
+ * LOW 128 bits of the immediately-preceding destination are kept live in an xmm
+ * (NX_CACHE) and reused when the next instruction's source slot matches — this
+ * is a pure copy of what was just written to rf, so it can never be stale. The
+ * HIGH 128 bits are always reloaded from rf (cheap, and sidesteps any stale-
+ * upper-half pitfall). The block clobbers only caller-saved GPRs (rax/rcx) and
+ * xmm; the tt template reloads ALL of rf into the real registers after the call,
+ * so any clobber is irrelevant. rsi (rf) and rbx/rsp/rbp/r12-15 are preserved.
+ *
+ * This file stays VEX-CLEAN: we only WRITE machine-code bytes (data) for the SSE
+ * (and VEX-encoded source, never compiled) instructions; the compiled C emits no
+ * VEX. The emitted block uses only SSE2/SSE4.1 (pand/por/pxor/psubb/pcmpeqb/
+ * pcmpgtb/pshufd/movd/pmovzxbw/psrldq), all present on the target Ivy Bridge.
+ *
+ * Op set: VPBROADCASTD, VPAND, VPOR, VPXOR, VPSUBB, VPCMPEQB, VPCMPGTB,
+ * VPMOVZXBW (each in register and memory-operand form). Any op outside the set,
+ * a segment override (seg!=0), or a memory destination -> decline the WHOLE run
+ * (avxemu_build_thunk_native returns NULL; caller falls back to C dispatch).
+ * Declining is never a correctness risk.
+ * ========================================================================== */
+#define RF_GPR_OFF 512   /* byte offset of gpr[0] within avxemu_regfile (16*32) */
+/* xmm register roles inside the emitted block (NX_ZERO is a pinned zero reg) */
+enum { NX_A_LO = 0, NX_A_HI = 1, NX_B_LO = 2, NX_B_HI = 3, NX_TMP = 4,
+       NX_CACHE = 6, NX_ZERO = 15 };
+#define NB_RSI 6   /* rf base pointer register (arg2) */
+#define NB_RAX 0   /* EA accumulator */
+#define NB_RCX 1   /* index scratch */
+
+static void nb(uint8_t **p, uint8_t b){ *(*p)++ = b; }
+static void nb32(uint8_t **p, uint32_t v){ memcpy(*p, &v, 4); *p += 4; }
+static void nb64(uint8_t **p, uint64_t v){ memcpy(*p, &v, 8); *p += 8; }
+
+/* SSE op  xmm[reg] , xmm[rm]   (ModRM mod=11). pre = mandatory/legacy prefix
+ * (0x66/0xF3/0), esc38 = use the 0F38 escape map. */
+static void sse_rr(uint8_t **p, uint8_t pre, int esc38, uint8_t op,
+                   int reg, int rm, int has_imm, uint8_t imm){
+    if (pre) nb(p, pre);
+    uint8_t rex = (uint8_t)(((reg >= 8) ? 4 : 0) | ((rm >= 8) ? 1 : 0));
+    if (rex) nb(p, (uint8_t)(0x40 | rex));
+    nb(p, 0x0F); if (esc38) nb(p, 0x38); nb(p, op);
+    nb(p, (uint8_t)(0xC0 | ((reg & 7) << 3) | (rm & 7)));
+    if (has_imm) nb(p, imm);
+}
+/* SSE op  xmm[reg] , [base + disp32]   (ModRM mod=10). base must not be rsp/r12
+ * (would need a SIB) — all callers use rsi or rax/rcx, never reg 4. */
+static void sse_rm(uint8_t **p, uint8_t pre, int esc38, uint8_t op,
+                   int reg, int base, int32_t disp, int has_imm, uint8_t imm){
+    if (pre) nb(p, pre);
+    uint8_t rex = (uint8_t)(((reg >= 8) ? 4 : 0) | ((base >= 8) ? 1 : 0));
+    if (rex) nb(p, (uint8_t)(0x40 | rex));
+    nb(p, 0x0F); if (esc38) nb(p, 0x38); nb(p, op);
+    nb(p, (uint8_t)(0x80 | ((reg & 7) << 3) | (base & 7)));
+    nb32(p, (uint32_t)disp);
+    if (has_imm) nb(p, imm);
+}
+static void nb_movdqu_load (uint8_t **p, int xmm, int base, int32_t d){ sse_rm(p, 0xF3, 0, 0x6F, xmm, base, d, 0, 0); }
+static void nb_movdqu_store(uint8_t **p, int xmm, int base, int32_t d){ sse_rm(p, 0xF3, 0, 0x7F, xmm, base, d, 0, 0); }
+static void nb_movdqa      (uint8_t **p, int dst, int src){ sse_rr(p, 0x66, 0, 0x6F, dst, src, 0, 0); }
+
+/* GPR EA helpers. All operate at 64-bit (REX.W). The memory base for the loads
+ * is always rsi (rf), encoded with mod=10 disp32. */
+static void nb_movabs_rax (uint8_t **p, uint64_t v){ nb(p, 0x48); nb(p, 0xB8); nb64(p, v); }
+static void nb_add_rax_mem(uint8_t **p, int32_t d){ nb(p, 0x48); nb(p, 0x03); nb(p, (uint8_t)(0x80 | (0 << 3) | NB_RSI)); nb32(p, (uint32_t)d); }
+static void nb_mov_rcx_mem(uint8_t **p, int32_t d){ nb(p, 0x48); nb(p, 0x8B); nb(p, (uint8_t)(0x80 | (1 << 3) | NB_RSI)); nb32(p, (uint32_t)d); }
+static void nb_shl_rcx    (uint8_t **p, uint8_t imm){ nb(p, 0x48); nb(p, 0xC1); nb(p, 0xE1); nb(p, imm); }
+static void nb_add_rax_rcx(uint8_t **p){ nb(p, 0x48); nb(p, 0x01); nb(p, 0xC8); }
+
+/* Compute the memory operand's effective address into rax, exactly mirroring
+ * ea_rf(): EA = disp + (rip_rel ? insn_addr+len : 0) + gpr[base] + gpr[index]*scale.
+ * Both the disp and the rip-relative term are known at emit time (insn_addr is
+ * the instruction's runtime address, recorded in the run_record), so they fold
+ * into a single 64-bit immediate. base/index are read live from rf->gpr. */
+static void emit_ea(uint8_t **p, const decoded *d, uint64_t addr){
+    uint64_t rip_next = addr + d->len;
+    int64_t c = (int64_t)d->disp + (d->rip_rel ? (int64_t)rip_next : 0);
+    nb_movabs_rax(p, (uint64_t)c);
+    if (d->base != OPND_NONE)  nb_add_rax_mem(p, RF_GPR_OFF + (int)d->base * 8);
+    if (d->index != OPND_NONE){
+        nb_mov_rcx_mem(p, RF_GPR_OFF + (int)d->index * 8);
+        uint8_t sh = (d->scale == 8) ? 3 : (d->scale == 4) ? 2 : (d->scale == 2) ? 1 : 0;
+        if (sh) nb_shl_rcx(p, sh);
+        nb_add_rax_rcx(p);
+    }
+}
+
+static int native_op_supported(vex_op op){
+    switch (op){
+    case VPBROADCASTD: case VPBROADCASTW: case VPAND: case VPOR: case VPXOR:
+    case VPSUBB: case VPCMPEQB: case VPCMPGTB: case VPMOVZXBW: return 1;
+    default: return 0;
+    }
+}
+static int native_is_binop(vex_op op){
+    switch (op){
+    case VPAND: case VPOR: case VPXOR: case VPSUBB: case VPCMPEQB: case VPCMPGTB: return 1;
+    default: return 0;
+    }
+}
+static int native_insn_supported(const decoded *d){
+    if (!native_op_supported(d->op)) return 0;
+    if (d->seg != 0) return 0;                 /* gs/fs: not supported -> decline run */
+    if (d->dst_kind != DST_YMM) return 0;      /* memory dest not implemented -> decline */
+    if (d->dst < 0 || d->dst > 15) return 0;
+    if (native_is_binop(d->op)){               /* src1 (VEX.vvvv) is always a register */
+        if (d->a_src < 0 || d->a_src > 15) return 0;
+    }
+    if (d->b_src == OPND_MEM){
+        if (d->base  != OPND_NONE && (d->base  < 0 || d->base  > 15)) return 0;
+        if (d->index != OPND_NONE && (d->index < 0 || d->index > 15)) return 0;
+    } else if (d->b_src < 0 || d->b_src > 15) return 0;
+    return 1;
+}
+
+/* Load register-slot's low (and, if wide, high) 128 bits into lo_reg/hi_reg.
+ * Low half reuses NX_CACHE when the slot is the previous destination. */
+static void load_slot(uint8_t **p, int slot, int lo_reg, int hi_reg, int wide, int prev_dst){
+    if (slot == prev_dst) nb_movdqa(p, lo_reg, NX_CACHE);
+    else                  nb_movdqu_load(p, lo_reg, NB_RSI, slot * 32);
+    if (wide)             nb_movdqu_load(p, hi_reg, NB_RSI, slot * 32 + 16);
+}
+/* Store result to dst slot: low always; high if wide, else zero the upper 128
+ * (VEX.128 semantics — matches avxemu_emulate's memset of the upper half). */
+static void store_dst(uint8_t **p, int slot, int lo_reg, int hi_reg, int wide){
+    nb_movdqu_store(p, lo_reg, NB_RSI, slot * 32);
+    if (wide) nb_movdqu_store(p, hi_reg, NB_RSI, slot * 32 + 16);
+    else      nb_movdqu_store(p, NX_ZERO, NB_RSI, slot * 32 + 16);
+}
+
+/* Emit one instruction. EA (if any) is computed into rax first. Returns 1 on
+ * success, 0 if (defensively) unhandled — caller then declines the run. */
+static int emit_one(uint8_t **p, const decoded *d, uint64_t addr, int *prev_dst){
+    int wide = d->wide;
+    int D = d->dst;
+    int mem = (d->b_src == OPND_MEM);
+    if (mem) emit_ea(p, d, addr);     /* rax = &memory operand */
+
+    switch (d->op){
+    case VPAND: case VPOR: case VPXOR: case VPSUBB: case VPCMPEQB: case VPCMPGTB: {
+        uint8_t opc = (d->op == VPAND)    ? 0xDB : (d->op == VPOR)     ? 0xEB :
+                      (d->op == VPXOR)    ? 0xEF : (d->op == VPSUBB)   ? 0xF8 :
+                      (d->op == VPCMPEQB) ? 0x74 : /* VPCMPGTB */        0x64;
+        load_slot(p, d->a_src, NX_A_LO, NX_A_HI, wide, *prev_dst);
+        if (mem){
+            nb_movdqu_load(p, NX_B_LO, NB_RAX, 0);
+            if (wide) nb_movdqu_load(p, NX_B_HI, NB_RAX, 16);
+        } else {
+            load_slot(p, d->b_src, NX_B_LO, NX_B_HI, wide, *prev_dst);
+        }
+        sse_rr(p, 0x66, 0, opc, NX_A_LO, NX_B_LO, 0, 0);          /* res.lo = a.lo OP b.lo */
+        if (wide) sse_rr(p, 0x66, 0, opc, NX_A_HI, NX_B_HI, 0, 0);
+        store_dst(p, D, NX_A_LO, NX_A_HI, wide);
+        nb_movdqa(p, NX_CACHE, NX_A_LO); *prev_dst = D;
+        break;
+    }
+    case VPBROADCASTD: {
+        /* load the source dword into the low dword, then pshufd $0 -> all lanes */
+        if (mem) sse_rm(p, 0x66, 0, 0x6E, NX_A_LO, NB_RAX, 0, 0, 0);          /* movd A_LO,[rax]      */
+        else     sse_rm(p, 0x66, 0, 0x6E, NX_A_LO, NB_RSI, d->b_src * 32, 0, 0);/* movd A_LO,[rsi+b*32] */
+        sse_rr(p, 0x66, 0, 0x70, NX_A_LO, NX_A_LO, 1, 0x00);                  /* pshufd A_LO,A_LO,0   */
+        if (wide) nb_movdqa(p, NX_A_HI, NX_A_LO);
+        store_dst(p, D, NX_A_LO, NX_A_HI, wide);
+        nb_movdqa(p, NX_CACHE, NX_A_LO); *prev_dst = D;
+        break;
+    }
+    case VPBROADCASTW: {
+        /* broadcast word 0 of the source to all 8 word lanes (per 128). For a
+         * memory source, read EXACTLY 2 bytes (pinsrw) so we never over-read past
+         * the word vpbroadcastw would touch; for a register slot, movd the low
+         * dword (its low word is word 0). Then pshuflw $0 replicates word 0 into
+         * the low 4 words, and pshufd $0 replicates the low qword across all 4
+         * dwords -> all 8 words = word 0. Matches vec_exec's 16x uint16 store. */
+        if (mem) sse_rm(p, 0x66, 0, 0xC4, NX_A_LO, NB_RAX, 0, 1, 0x00);        /* pinsrw A_LO,[rax],0  */
+        else     sse_rm(p, 0x66, 0, 0x6E, NX_A_LO, NB_RSI, d->b_src * 32, 0, 0);/* movd  A_LO,[rsi+b*32] */
+        sse_rr(p, 0xF2, 0, 0x70, NX_A_LO, NX_A_LO, 1, 0x00);                  /* pshuflw A_LO,A_LO,0  */
+        sse_rr(p, 0x66, 0, 0x70, NX_A_LO, NX_A_LO, 1, 0x00);                  /* pshufd  A_LO,A_LO,0  */
+        if (wide) nb_movdqa(p, NX_A_HI, NX_A_LO);
+        store_dst(p, D, NX_A_LO, NX_A_HI, wide);
+        nb_movdqa(p, NX_CACHE, NX_A_LO); *prev_dst = D;
+        break;
+    }
+    case VPMOVZXBW: {
+        /* zero-extend bytes->words. Low lane <- src bytes 0..7; (wide) high lane
+         * <- src bytes 8..15. Matches vec_exec's out[i]=src[i] across 16 words. */
+        if (mem){
+            sse_rm(p, 0x66, 1, 0x30, NX_A_LO, NB_RAX, 0, 0, 0);              /* pmovzxbw A_LO,[rax]   */
+            if (wide) sse_rm(p, 0x66, 1, 0x30, NX_A_HI, NB_RAX, 8, 0, 0);    /* pmovzxbw A_HI,[rax+8] */
+        } else {
+            if (d->b_src == *prev_dst) nb_movdqa(p, NX_B_LO, NX_CACHE);
+            else nb_movdqu_load(p, NX_B_LO, NB_RSI, d->b_src * 32);
+            sse_rr(p, 0x66, 1, 0x30, NX_A_LO, NX_B_LO, 0, 0);               /* pmovzxbw A_LO,B_LO    */
+            if (wide){
+                nb_movdqa(p, NX_TMP, NX_B_LO);
+                sse_rr(p, 0x66, 0, 0x73, 3, NX_TMP, 1, 8);                  /* psrldq TMP,8 (/3)     */
+                sse_rr(p, 0x66, 1, 0x30, NX_A_HI, NX_TMP, 0, 0);           /* pmovzxbw A_HI,TMP     */
+            }
+        }
+        store_dst(p, D, NX_A_LO, NX_A_HI, wide);
+        nb_movdqa(p, NX_CACHE, NX_A_LO); *prev_dst = D;
+        break;
+    }
+    default: return 0;
+    }
+    return 1;
+}
+
+/* AVXEMU_NATIVE gate (default ON; =0 forces the legacy C-dispatch thunks). */
+static int g_native = -1;
+static int native_enabled(void){
+    if (g_native < 0){ const char *e = getenv("AVXEMU_NATIVE"); g_native = (e && e[0] == '0') ? 0 : 1; }
+    return g_native;
+}
+
+/* ---- AVXEMU_NATIVE_STATS: build-time run-composition tally (env-gated). Counts
+ * runs the native emitter would accept vs decline, run-length single vs multi,
+ * and for declined runs the first unsupported (blocking) op. Printed at end of
+ * install_trampolines. Pure diagnostic; no effect on what gets emitted. */
+static int g_nstats = -1;
+static int nstats_enabled(void){
+    if (g_nstats < 0){ const char *e = getenv("AVXEMU_NATIVE_STATS"); g_nstats = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return g_nstats;
+}
+static uint64_t g_ns_accept, g_ns_decline, g_ns_single, g_ns_multi;
+static uint64_t g_ns_block_op[VEX_OP_COUNT];
+static void nstats_tally(const tramp_insn *ri, int rn){
+    if (rn == 1) g_ns_single++; else g_ns_multi++;
+    int blk = -1;
+    for (int k = 0; k < rn; k++) if (!native_insn_supported(&ri[k].dec)){ blk = ri[k].dec.op; break; }
+    if (blk < 0) g_ns_accept++;
+    else { g_ns_decline++; g_ns_block_op[blk]++; }
+}
+
+/* Emit the native SSE `block` for a run into the RWX pool. Returns the block
+ * entry, or NULL if any instruction is unsupported or the pool is exhausted.
+ * Bypasses the AVXEMU_NATIVE gate (raw emitter; the gate is in the thunk
+ * builder) so the differential test can always exercise it. */
+void *avxemu_emit_native_block(const tramp_insn *insns, int n){
+    if (n <= 0) return 0;
+    for (int i = 0; i < n; i++) if (!native_insn_supported(&insns[i].dec)) return 0;
+    uint8_t buf[MAXRUN * 160];
+    uint8_t *p = buf;
+    sse_rr(&p, 0x66, 0, 0xEF, NX_ZERO, NX_ZERO, 0, 0);   /* pxor xmm15,xmm15 (zero reg) */
+    int prev_dst = -1;
+    for (int i = 0; i < n; i++){
+        if (!emit_one(&p, &insns[i].dec, insns[i].addr, &prev_dst)) return 0;
+        if ((size_t)(p - buf) > sizeof buf - 128) return 0;   /* overflow guard */
+    }
+    nb(&p, 0xC3);   /* ret */
+    size_t sz = (size_t)(p - buf);
+    uint8_t *blk = avxemu_pool_alloc(sz);
+    if (!blk) return 0;
+    memcpy(blk, buf, sz);
+    return blk;
+}
+
+/* Native-SSE thunk: a tt-template thunk whose dispatch pointer is the emitted
+ * native block instead of avxemu_tramp_dispatch. The spill/reload/resume is the
+ * unchanged tt template. Returns NULL (caller falls back) if disabled, any op is
+ * unsupported, or the pool is exhausted. */
+void *avxemu_build_thunk_native(const tramp_insn *insns, int n, uint64_t resume){
+    if (!native_enabled()) return 0;
+    void *block = avxemu_emit_native_block(insns, n);
+    if (!block) return 0;
+    return build_thunk_t(insns, n, resume, avxemu_tt_start, avxemu_tt_record,
+                         avxemu_tt_dispatchptr, avxemu_tt_resumeptr, block);
+}
+
+/* ============================================================================
+ * Milestone B (Task 2): scalar-GPR native codegen for the trampoline.
+ *
+ * Trampolined LZCNT currently runs through the tt2 (GPR+flags spill) thunk ->
+ * avxemu_tramp_dispatch_bmi -> per-instruction C (bmi_exec). This emits a native
+ * straight-line block(run_record* rdi, avxemu_regfile* rf=rsi) that operates on
+ * the SPILLED rf->gpr[] slots (rsi+512+reg*8) and rf->rflags slot (rsi+640) — the
+ * exact same memory image the tt2 thunk saved — then returns. The tt2 thunk
+ * reloads every GPR + popf's rflags from those slots afterward, so the block may
+ * clobber any caller-saved GPR; it only must preserve rsi (its base) and rsp.
+ *
+ * Host is no-BMI/no-LZCNT Ivy Bridge: the lowering uses ONLY base-ISA GPR ops
+ * (bsr + fixups, NEVER lzcnt — which would #UD). This file stays VEX-clean: we
+ * only WRITE machine-code bytes (data); the compiled C emits no VEX and (for this
+ * GPR-domain block) no SSE either, so it is safe under the no-vector-save tt2.
+ *
+ * LZCNT semantics, bit-exact to bmi_exec/set_flags:
+ *   result = (src==0) ? opsize : (opsize-1 - bsr(src))
+ *   CF = (src==0);  ZF = (result==0);  SF = 0;  OF = 0;  PF/AF preserved.
+ *   opsize 32 zero-extends the dst slot's full 64 bits.
+ * Only the owned flag bits (CF|ZF|SF|OF) of the rf->rflags slot are rewritten
+ * (read-modify-write with mask ~0x8C1), preserving PF/AF and every other bit.
+ * ========================================================================== */
+#define RF_FLAGS_OFF 640   /* byte offset of rflags within avxemu_regfile */
+/* fixed scratch CPU regs for the block (all caller-saved & reloaded by tt2; none
+ * is rsi=6, the rf base): S=rax, D=rcx, T1=rdx, T2=r8, F=r9. The decoded dst/src
+ * are SLOT indices (memory), independent of these. */
+enum { GB_S = 0, GB_D = 1, GB_T1 = 2, GB_T2 = 8, GB_F = 9 };
+
+static void gb_rex(uint8_t **p, int w, int reg, int rm){
+    uint8_t r = (uint8_t)((w?8:0) | ((reg>=8)?4:0) | ((rm>=8)?1:0));
+    if (r) nb(p, (uint8_t)(0x40 | r));
+}
+/* mov reg, [rsi+disp32]   (w=1: 64-bit; w=0: 32-bit, zero-extends to 64) */
+static void gb_load(uint8_t **p, int reg, int32_t disp, int w){
+    gb_rex(p, w, reg, NB_RSI);
+    nb(p, 0x8B); nb(p, (uint8_t)(0x80 | ((reg&7)<<3) | NB_RSI)); nb32(p, (uint32_t)disp);
+}
+/* mov [rsi+disp32], reg   (always 64-bit: writes the full slot) */
+static void gb_store(uint8_t **p, int reg, int32_t disp){
+    gb_rex(p, 1, reg, NB_RSI);
+    nb(p, 0x89); nb(p, (uint8_t)(0x80 | ((reg&7)<<3) | NB_RSI)); nb32(p, (uint32_t)disp);
+}
+static void gb_alu_rr(uint8_t **p, int w, uint8_t opc, int reg, int rm){
+    gb_rex(p, w, reg, rm); nb(p, opc); nb(p, (uint8_t)(0xC0 | ((reg&7)<<3) | (rm&7)));
+}
+static void gb_alu0f_rr(uint8_t **p, int w, uint8_t opc, int reg, int rm){
+    gb_rex(p, w, reg, rm); nb(p, 0x0F); nb(p, opc); nb(p, (uint8_t)(0xC0 | ((reg&7)<<3) | (rm&7)));
+}
+static void gb_xor  (uint8_t **p,int w,int d,int s){ gb_alu_rr(p,w,0x31,s,d); }  /* d ^= s   */
+static void gb_or   (uint8_t **p,int w,int d,int s){ gb_alu_rr(p,w,0x09,s,d); }  /* d |= s   */
+static void gb_sub  (uint8_t **p,int w,int d,int s){ gb_alu_rr(p,w,0x29,s,d); }  /* d -= s   */
+static void gb_test (uint8_t **p,int w,int a,int b){ gb_alu_rr(p,w,0x85,a,b); }  /* test a,b */
+static void gb_bsr  (uint8_t **p,int w,int d,int s){ gb_alu0f_rr(p,w,0xBD,d,s); }
+static void gb_cmovz(uint8_t **p,int w,int d,int s){ gb_alu0f_rr(p,w,0x44,d,s); }
+/* setz r8l. Force a REX so r8..r15 (and r4..r7) select the proper low byte. */
+static void gb_setz (uint8_t **p,int r){ nb(p,(uint8_t)(0x40|((r>=8)?1:0))); nb(p,0x0F); nb(p,0x94); nb(p,(uint8_t)(0xC0|(r&7))); }
+static void gb_shl_imm(uint8_t **p,int w,int r,uint8_t i){ gb_rex(p,w,0,r); nb(p,0xC1); nb(p,(uint8_t)(0xC0|(4<<3)|(r&7))); nb(p,i); }
+static void gb_mov_imm32(uint8_t **p,int r,uint32_t imm){ if(r>=8) nb(p,0x41); nb(p,(uint8_t)(0xB8|(r&7))); nb32(p,imm); } /* zero-extends to 64 */
+static void gb_and_imm32(uint8_t **p,int w,int r,uint32_t imm){ gb_rex(p,w,0,r); nb(p,0x81); nb(p,(uint8_t)(0xC0|(4<<3)|(r&7))); nb32(p,imm); } /* sign-extends imm32 */
+
+/* Emit one LZCNT into the scalar block. Mirrors reloc.c's LZCNT lowering for the
+ * value+flag arithmetic, but reads src and writes dst/flags via the rf MEMORY
+ * slots (not live registers), and patches the rf->rflags slot instead of a saved
+ * pushf image. dst==src is safe: src is loaded into a register first, and the dst
+ * slot is written only at the very end. */
+static int gb_emit_lzcnt(uint8_t **p, const decoded *d){
+    const int w = (d->opsize == 64);
+    const uint32_t n = d->opsize;
+    const uint32_t CLR = 0xFFFFF73Eu;   /* ~(CF|ZF|SF|OF) = ~0x8C1, sign-extended to 64 in AND */
+    const int S = GB_S, D = GB_D, T1 = GB_T1, T2 = GB_T2, F = GB_F;
+
+    gb_load(p, S, RF_GPR_OFF + d->a_src * 8, w);   /* S = rf->gpr[src] (masked to opsize) */
+    gb_xor (p, 1, T1, T1);                          /* T1 = 0 */
+    gb_test(p, w, S, S);                            /* ZF = (src==0)  [src not clobbered below] */
+    gb_setz(p, T1);                                 /* T1 = (src==0) -> CF */
+    gb_bsr (p, w, D, S);                            /* D = bsr(src)  (undef if src==0) */
+    gb_mov_imm32(p, T2, n - 1);                     /* T2 = opsize-1 */
+    gb_sub (p, 1, T2, D);                           /* T2 = (opsize-1) - bsr = lzcnt for src!=0 */
+    gb_test(p, 1, T1, T1);                          /* ZF = (T1==0) = (src!=0) */
+    gb_mov_imm32(p, D, n);                          /* D = opsize (zero-input result) */
+    gb_cmovz(p, 1, D, T2);                          /* src!=0 -> D = T2 */
+    /* ZF = (result==0) -> bit6; SF=0, OF=0 */
+    gb_xor (p, 1, T2, T2);
+    gb_test(p, w, D, D);
+    gb_setz(p, T2);
+    gb_shl_imm(p, 1, T2, 6);
+    gb_or  (p, 1, T1, T2);                          /* owned = CF | ZF */
+    /* patch rf->rflags: clear owned bits, OR in computed, preserve PF/AF/rest */
+    gb_load(p, F, RF_FLAGS_OFF, 1);
+    gb_and_imm32(p, 1, F, CLR);
+    gb_or  (p, 1, F, T1);
+    gb_store(p, F, RF_FLAGS_OFF);
+    gb_store(p, D, RF_GPR_OFF + d->dst * 8);        /* result (upper 32 zero for opsize 32) */
+    return 1;
+}
+
+/* Is this insn a scalar-GPR op the native scalar block supports? (LZCNT only for
+ * now; register operands, no memory/segment, opsize 32/64.) */
+static int bmi_native_insn_supported(const decoded *d){
+    if (!d->is_bmi || d->op != BMI_LZCNT) return 0;
+    if (d->dst_kind != DST_GPR) return 0;
+    if (!(d->opsize == 32 || d->opsize == 64)) return 0;
+    if (d->seg != 0) return 0;
+    if (d->a_src == OPND_MEM || d->b_src == OPND_MEM || d->dst_kind == DST_MEM) return 0;
+    if (d->dst < 0 || d->dst > 15) return 0;
+    if (d->a_src < 0 || d->a_src > 15) return 0;
+    if (d->bmi_dst2 != OPND_NONE || d->bmi_s1_rdx) return 0;
+    return 1;
+}
+
+/* Emit the native scalar-GPR `block` for a run into the RWX pool. Returns the
+ * block entry, or NULL if any instruction is unsupported or the pool is
+ * exhausted. Bypasses the AVXEMU_NATIVE gate (the gate is in the thunk builder)
+ * so the differential test can always exercise it. */
+void *avxemu_emit_native_block_bmi(const tramp_insn *insns, int n){
+    if (n <= 0) return 0;
+    for (int i = 0; i < n; i++) if (!bmi_native_insn_supported(&insns[i].dec)) return 0;
+    uint8_t buf[MAXRUN * 160];
+    uint8_t *p = buf;
+    for (int i = 0; i < n; i++){
+        if (!gb_emit_lzcnt(&p, &insns[i].dec)) return 0;
+        if ((size_t)(p - buf) > sizeof buf - 128) return 0;   /* overflow guard */
+    }
+    nb(&p, 0xC3);   /* ret */
+    size_t sz = (size_t)(p - buf);
+    uint8_t *blk = avxemu_pool_alloc(sz);
+    if (!blk) return 0;
+    memcpy(blk, buf, sz);
+    return blk;
+}
+
+/* True iff every instruction in the run is a scalar-GPR op the native block
+ * supports (currently: register-operand LZCNT). */
+static int run_is_native_bmi(const tramp_insn *insns, int n){
+    for (int i = 0; i < n; i++) if (!bmi_native_insn_supported(&insns[i].dec)) return 0;
+    return n > 0;
+}
+
+/* Native scalar-GPR thunk: a tt2-template thunk (GPR+flags spill, NO vector save
+ * — correct since LZCNT touches no vector reg) whose dispatch pointer is the
+ * emitted scalar block. Returns NULL (caller falls back) if disabled, any op is
+ * unsupported, or the pool is exhausted. */
+void *avxemu_build_thunk_native_bmi(const tramp_insn *insns, int n, uint64_t resume){
+    if (!native_enabled()) return 0;
+    void *block = avxemu_emit_native_block_bmi(insns, n);
+    if (!block) return 0;
+    return build_thunk_t(insns, n, resume, avxemu_tt2_start, avxemu_tt2_record,
+                         avxemu_tt2_dispatchptr, avxemu_tt2_resumeptr, block);
+}
+
 /* Scan one cleanly-decoding function and trampoline its faulting runs. Returns
  * the number of jmps written. Patches go to the live (already-writable) text. */
 /* Place the trampoline for one gathered run of faulting instructions: pick the
@@ -263,11 +758,24 @@ static long emit_run(uint8_t *text, size_t fstart, size_t fend,
     }
     if (s < ni && re - offs[s] >= 5) {
         const tramp_insn *ri = insns + s; int rn = ni - s;
+        if (g_nstats) nstats_tally(ri, rn);   /* AVXEMU_NATIVE_STATS diagnostic */
         uint64_t res = (uint64_t)(text + re);
-        void *thunk = g_force_full                ? avxemu_build_thunk(ri, rn, res)
-                    : run_is_regonly_bmi(ri, rn) ? build_thunk_bmi(ri, rn, res)
-                    : run_is_gpr_only(ri, rn)     ? build_thunk_gpr(ri, rn, res)
-                    :                               avxemu_build_thunk(ri, rn, res);
+        /* Milestone B: try the register-resident native-SSE thunk first (gated by
+         * AVXEMU_NATIVE, default ON). On NULL — op outside the supported set, a
+         * segment/mem-dest operand, pool exhausted, or gate off — fall back to the
+         * existing C-dispatch thunk selection (full/gpr/bmi). No correctness risk. */
+        void *thunk = g_force_full ? 0 : avxemu_build_thunk_native(ri, rn, res);
+        /* Task 2: scalar-GPR native (register-only LZCNT) via the tt2 thunk. The
+         * vector native attempt above declines BMI ops, so this runs next. NULL
+         * (gate off, op outside the scalar set, or pool exhausted) -> existing C
+         * thunk selection. No correctness risk. */
+        if (!thunk && !g_force_full && run_is_native_bmi(ri, rn))
+            thunk = avxemu_build_thunk_native_bmi(ri, rn, res);
+        if (!thunk)
+            thunk = g_force_full              ? avxemu_build_thunk(ri, rn, res)
+                  : run_is_regonly_bmi(ri, rn) ? build_thunk_bmi(ri, rn, res)
+                  : run_is_gpr_only(ri, rn)    ? build_thunk_gpr(ri, rn, res)
+                  :                              avxemu_build_thunk(ri, rn, res);
         if (thunk) {
             uint8_t *site = text + offs[s];
             int64_t rel = (int64_t)((uint8_t *)thunk - (site + 5));
@@ -467,6 +975,16 @@ long avxemu_install_trampolines(void) {
     detect_features();
     if (!g_lack_avx2 && !g_lack_fma && !g_lack_bmi && !g_lack_f16c) return 0;  /* nothing faults here */
 
+    /* Diagnostics (env-gated): resolve flags now so the hot path sees them, and
+     * arm the SIGUSR2 / atexit histogram dump if AVXEMU_OPHIST is set. */
+    (void)nstats_enabled();
+    if (ophist_enabled()){
+        struct sigaction sa; memset(&sa, 0, sizeof sa);
+        sa.sa_handler = ophist_sigusr2; sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR2, &sa, 0);
+        atexit(ophist_dump);
+    }
+
     /* per-thread side-stack key, created here (single-threaded) before any thunk runs */
     if (!g_side_key_ok && pthread_key_create(&g_side_key, 0) == 0) g_side_key_ok = 1;
 
@@ -552,5 +1070,21 @@ long avxemu_install_trampolines(void) {
     }
 
     vm_protect(task, (vm_address_t)lo, (vm_size_t)(hi - lo), FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+
+    if (g_nstats){   /* AVXEMU_NATIVE_STATS run-composition report (stderr) */
+        emit("=== AVXEMU_NATIVE_STATS (install-time run composition) ===\n");
+        emit("native-accept runs\t"); as_u64(2, g_ns_accept); emit("\n");
+        emit("native-decline runs\t"); as_u64(2, g_ns_decline); emit("\n");
+        emit("single-insn runs\t"); as_u64(2, g_ns_single); emit("\n");
+        emit("multi-insn runs\t"); as_u64(2, g_ns_multi); emit("\n");
+        int idx[VEX_OP_COUNT]; int m = 0;
+        for (int i = 0; i < VEX_OP_COUNT; i++) if (g_ns_block_op[i]) idx[m++] = i;
+        for (int i = 0; i < m; i++){ int best = i;
+            for (int j = i + 1; j < m; j++) if (g_ns_block_op[idx[j]] > g_ns_block_op[idx[best]]) best = j;
+            int t = idx[i]; idx[i] = idx[best]; idx[best] = t; }
+        emit("-- first-blocking op in declined runs (desc) --\n");
+        for (int i = 0; i < m; i++){ const char *nm = vex_op_name((vex_op)idx[i]);
+            emit(nm); emit("\t"); as_u64(2, g_ns_block_op[idx[i]]); emit("\n"); }
+    }
     return total;
 }
