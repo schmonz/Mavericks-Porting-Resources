@@ -226,13 +226,19 @@ long lde_rd_zcnt(const uint8_t *text, size_t fstart, size_t fend, size_t readabl
     uint8_t *vis = calloc(n, 1); size_t *stk = malloc(n * sizeof(size_t));
     if (!vis || !stk) { free(vis); free(stk); return 0; }
     size_t sp = 0; long cnt = 0; long last_lea = -1;   /* table base offset from most recent leaq-rip */
-    stk[sp++] = fstart;
+    /* Mark visited at PUSH time, not pop: a node enters the stack at most once,
+     * so sp never exceeds n (the stack has n slots). Marking on pop instead let a
+     * node reachable from many predecessors — high fan-in, or a dense switch table
+     * with repeated entries — be pushed once per in-edge, overrunning stk and
+     * corrupting the heap (cf. lde_rd_map's RD_PUSH guard, which this mirrors). */
+    #define Z_PUSH(X) do { size_t _x = (size_t)(X); \
+        if (_x >= fstart && _x < fend && !vis[_x - fstart] && sp < n) { \
+            vis[_x - fstart] = 1; stk[sp++] = _x; } } while (0)
+    Z_PUSH(fstart);
     while (sp) {
         size_t off = stk[--sp];
-        if (off < fstart || off >= fend || vis[off - fstart]) continue;
         int zk, o2; int len = x86_len(text + off, text + fend, &zk, &o2);
         if (len <= 0) continue;
-        vis[off - fstart] = 1;
         if (zk && o2 >= 0 && text[off + o2] == 0xF3 && cnt < maxout) out[cnt++] = off;
 
         int32_t disp;
@@ -246,14 +252,15 @@ long lde_rd_zcnt(const uint8_t *text, size_t fstart, size_t fend, size_t readabl
                 int32_t entry; memcpy(&entry, text + e, 4);
                 long tgt = last_lea + entry;
                 if (tgt < (long)fstart || tgt >= (long)fend) break;   /* past table */
-                if (!vis[tgt - fstart]) stk[sp++] = (size_t)tgt;
+                Z_PUSH(tgt);
             }
         }
         int term; long tgt;
         cflow(text + off, text + fend, len, (long)off, &term, &tgt);
-        if (tgt >= 0 && (size_t)tgt >= fstart && (size_t)tgt < fend && !vis[tgt - fstart]) stk[sp++] = (size_t)tgt;
-        if (!term) { size_t fa = off + len; if (fa < fend && !vis[fa - fstart]) stk[sp++] = fa; }
+        if (tgt >= 0) Z_PUSH(tgt);
+        if (!term) Z_PUSH(off + len);
     }
+    #undef Z_PUSH
     free(vis); free(stk);
     return cnt;
 }

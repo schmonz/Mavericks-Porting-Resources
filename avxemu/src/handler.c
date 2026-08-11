@@ -329,8 +329,16 @@ static void chain(int sig, siginfo_t *info, void *uctx) {
     } else if (g_old.sa_handler && g_old.sa_handler != SIG_DFL) {
         g_old.sa_handler(sig); return;
     }
-    /* default: restore and re-raise so the genuine fault crashes as expected */
-    signal(sig, SIG_DFL);
+    /* default: restore the genuine default disposition and re-raise so an
+     * instruction we don't emulate surfaces as a real #UD. This MUST go through
+     * the real sigaction, not our interposed signal()/sigaction: for an owned
+     * SIGILL those only record a new chain target and leave on_sigill frontline,
+     * so signal(sig, SIG_DFL); raise(sig); would re-enter this handler forever
+     * (an infinite SIGILL loop — observed as a hang on any unimplemented insn,
+     * e.g. AVX2 gathers). Mirrors the on_crash chain path. */
+    struct sigaction da; memset(&da, 0, sizeof da);
+    da.sa_handler = SIG_DFL; sigemptyset(&da.sa_mask);
+    real_sigaction()(sig, &da, 0);
     raise(sig);
 }
 
