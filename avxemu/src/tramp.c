@@ -808,25 +808,158 @@ static size_t gather_run(uint8_t *text, size_t fstart, size_t fend, size_t q,
     return p;
 }
 
+/* ---- bounded jump-table resolution (fault-storm fix) ------------------------
+ * The dominant repeat-faulting sites live in functions whose only indirect jmps
+ * are LLVM switch dispatches:
+ *     cmp  rI, imm          ; unsigned bound: valid index 0..imm
+ *     ja   <default>        ; forward, past the dispatch
+ *     lea  rB, [rip+d32]    ; table base (rel32-entry table, usually inline)
+ *     movsxd rD, [rB+rI*4]  ; load rel32 entry
+ *     add  rD, rB           ; absolute target
+ *     jmp  *rD
+ * That target set is STATICALLY ENUMERABLE: entries e_i at [tbl, tbl+4*(imm+1)),
+ * targets tbl+e_i. resolve_jump_table() matches the pattern against the last few
+ * decoded instructions ending at the `jmp *rD` and, on an EXACT match, marks
+ * every in-function target in tgt[] and records the inline table bytes as data
+ * (so the linear walk skips them instead of desyncing). ANY mismatch returns 0
+ * and the caller keeps the blanket has_indirect decline — the safe floor.
+ * Index bound: cmp+ja when present; else a `movzx rI, r/m8` defining the index
+ * within the window bounds it to 256. No bound => no resolution. ------------- */
+#define JT_RING 8            /* lookback: cmp,ja,lea,movsxd,add precede the jmp */
+#define JT_MAX_ENTRIES 16384
+#define JT_MAX_TABLES 16
+typedef struct { size_t lo, hi; } jt_range;
+
+/* modrm/rex field helpers over a single-instruction byte view */
+static int jt_rex(const uint8_t *p, int *rex){   /* optional single REX; no other prefixes */
+    if ((p[0] & 0xF0) == 0x40) { *rex = p[0]; return 1; }
+    *rex = 0; return 0;
+}
+static int resolve_jump_table(uint8_t *text, size_t fstart, size_t fend,
+                              const size_t *ring, int nring, size_t jq, int jlen,
+                              uint8_t *tgt, jt_range *tab, int *ntab) {
+    if (nring < 3) return 0;
+    /* jmp *rD : [rex] FF /4 mod=11 */
+    { const uint8_t *p = text + jq; int rex, k = jt_rex(p, &rex);
+      if (p[k] != 0xFF || ((p[k+1] >> 3) & 7) != 4 || (p[k+1] >> 6) != 3) return 0;
+      if (k + 2 != jlen) return 0;
+      int rD = (p[k+1] & 7) | ((rex & 1) << 3);
+
+      /* prev1: add rD, rB  (01 /r: dst=rm ; 03 /r: dst=reg) */
+      const uint8_t *a = text + ring[nring-1]; int arex, ak = jt_rex(a, &arex);
+      int rB;
+      if (a[ak] == 0x01 && (a[ak+1] >> 6) == 3) {
+          int rm  = (a[ak+1] & 7)        | ((arex & 1) << 3);
+          int reg = ((a[ak+1] >> 3) & 7) | ((arex & 4) << 1);
+          if (rm != rD) return 0; rB = reg;
+      } else if (a[ak] == 0x03 && (a[ak+1] >> 6) == 3) {
+          int reg = ((a[ak+1] >> 3) & 7) | ((arex & 4) << 1);
+          int rm  = (a[ak+1] & 7)        | ((arex & 1) << 3);
+          if (reg != rD) return 0; rB = rm;
+      } else return 0;
+
+      /* prev2: movsxd rD, [rB + rI*4]  (63 /r mod=00 rm=100, SIB scale=2) */
+      const uint8_t *m = text + ring[nring-2]; int mrex, mk = jt_rex(m, &mrex);
+      if (m[mk] != 0x63 || (m[mk+1] >> 6) != 0 || (m[mk+1] & 7) != 4) return 0;
+      { int reg = ((m[mk+1] >> 3) & 7) | ((mrex & 4) << 1);
+        if (reg != rD) return 0; }
+      if ((m[mk+2] >> 6) != 2) return 0;                       /* scale = *4 */
+      int rI = ((m[mk+2] >> 3) & 7) | ((mrex & 2) << 2);
+      { int base = (m[mk+2] & 7) | ((mrex & 1) << 3);
+        if (base != rB || (m[mk+2] & 7) == 5) return 0; }      /* base==101 needs disp */
+
+      /* prev3: lea rB, [rip+d32]  (8D /r mod=00 rm=101) -> table offset */
+      const uint8_t *l = text + ring[nring-3]; int lrex, lk = jt_rex(l, &lrex);
+      if (l[lk] != 0x8D || (l[lk+1] >> 6) != 0 || (l[lk+1] & 7) != 5) return 0;
+      { int reg = ((l[lk+1] >> 3) & 7) | ((lrex & 4) << 1);
+        if (reg != rB) return 0; }
+      if (rB == rI || rB == rD) return 0;   /* aliased base would corrupt the pattern */
+      int32_t d32; memcpy(&d32, l + lk + 2, 4);
+      size_t lea_end = ring[nring-3] + (size_t)lk + 6;
+      long tbl_l = (long)lea_end + d32;
+      if (tbl_l < (long)fstart || (size_t)tbl_l >= fend) return 0;   /* table must be in-function */
+      size_t tbl = (size_t)tbl_l;
+
+      /* Index bound: `cmp rI,imm` guarded by a forward ja past the jmp, or a
+       * `movzx rI, r/m8` (bounds the index to 0..255). SOUNDNESS: every ring
+       * instruction between the bounding insn and the movsxd must be one we
+       * fully understand as not writing rI — only the guarding ja and the lea
+       * (which writes rB != rI) qualify. Anything else => unproven => fail. */
+      long n_ent = -1; int ja_seen = 0;
+      for (int h = nring - 4; h >= 0; h--) {
+          const uint8_t *c = text + ring[h]; int crex, ck = jt_rex(c, &crex);
+          /* guarding ja: part of the gap; note whether it jumps past the dispatch */
+          if (c[0] == 0x77) {
+              if ((long)ring[h] + 2 + (int8_t)c[1] > (long)jq) ja_seen = 1;
+              continue;
+          }
+          if (c[0] == 0x0F && c[1] == 0x87) {
+              int32_t v; memcpy(&v, c + 2, 4);
+              if ((long)ring[h] + 6 + v > (long)jq) ja_seen = 1;
+              continue;
+          }
+          long imm = -1;
+          if (c[ck] == 0x83 && (c[ck+1] >> 6) == 3 && ((c[ck+1] >> 3) & 7) == 7
+              && ((c[ck+1] & 7) | ((crex & 1) << 3)) == rI)
+              imm = (int8_t)c[ck+2];
+          else if (c[ck] == 0x81 && (c[ck+1] >> 6) == 3 && ((c[ck+1] >> 3) & 7) == 7
+                   && ((c[ck+1] & 7) | ((crex & 1) << 3)) == rI)
+              { int32_t v; memcpy(&v, c + ck + 2, 4); imm = v; }
+          else if (c[ck] == 0x3D && rI == 0)
+              { int32_t v; memcpy(&v, c + ck + 1, 4); imm = v; }
+          else if (c[ck] == 0x0F && c[ck+1] == 0xB6
+                   && (((c[ck+2] >> 3) & 7) | ((crex & 4) << 1)) == rI)
+              { n_ent = 256; break; }        /* movzx 8-bit index: bound needs no ja */
+          if (imm < 0) return 0;             /* unknown insn in the gap -> unproven */
+          if (!ja_seen || imm < 0) return 0; /* cmp without a guarding ja -> unproven */
+          n_ent = imm + 1;
+          break;
+      }
+      if (n_ent <= 0 || n_ent > JT_MAX_ENTRIES) return 0;
+      if (tbl + 4u * (size_t)n_ent > fend) return 0;           /* table must fit in-function */
+      if (*ntab >= JT_MAX_TABLES) return 0;
+
+      /* mark every in-function target; record the table as data to skip */
+      for (long i = 0; i < n_ent; i++) {
+          int32_t e; memcpy(&e, text + tbl + 4 * (size_t)i, 4);
+          long t = (long)tbl + e;
+          if (t >= (long)fstart && t < (long)fend) tgt[t - fstart] = 1;
+      }
+      tab[*ntab].lo = tbl; tab[*ntab].hi = tbl + 4u * (size_t)n_ent; (*ntab)++;
+      return 1;
+    }
+}
+
 /* Pass-1 branch-target collection over one function [fstart,fend) (offsets into
  * text). Marks tgt[off-fstart]=1 at every in-function direct branch target, and
- * sets *has_indirect if any indirect jmp is seen. Returns 1 if the function
- * decoded cleanly to its boundary, 0 on a length-decode desync (caller treats a 0
- * conservatively). Shared by the eager scanner (scan_function) and the runtime
- * patch-safety check (avxemu_patch_safe). tgt[] must be caller-allocated, length
- * >= fend-fstart and pre-zeroed. */
+ * sets *has_indirect if any UNRESOLVED indirect jmp is seen (bounded jump-table
+ * dispatches are resolved: their targets are marked and their inline table bytes
+ * skipped as data). Returns 1 if the function decoded cleanly to its boundary, 0
+ * on a length-decode desync (caller treats a 0 conservatively). Shared by the
+ * eager scanner (scan_function) and the runtime patch-safety check
+ * (avxemu_patch_safe). tgt[] must be caller-allocated, length >= fend-fstart and
+ * pre-zeroed. */
 static int collect_branch_targets(uint8_t *text, size_t fstart, size_t fend,
                                   uint8_t *tgt, int *has_indirect) {
     *has_indirect = 0;
+    size_t ring[JT_RING]; int nring = 0;
+    jt_range tab[JT_MAX_TABLES]; int ntab = 0;
     size_t q = fstart;
     while (q < fend) {
+        int skipped = 0;
+        for (int i = 0; i < ntab; i++)
+            if (q >= tab[i].lo && q < tab[i].hi) { q = tab[i].hi; skipped = 1; break; }
+        if (skipped) { nring = 0; continue; }              /* table data: not code */
         if (fend - q <= 15) { int pad = 1; for (size_t r = q; r < fend; r++) if (text[r]&&text[r]!=0xCC&&text[r]!=0x90){pad=0;break;} if (pad) break; }
         int zk, o2; int len = x86_len(text + q, text + fend, &zk, &o2);
         if (len <= 0) return 0;
         int term; long t; int ind;
         lde_cflow(text + q, text + fend, len, (long)q, &term, &t, &ind);
-        if (ind) *has_indirect = 1;
+        if (ind && !resolve_jump_table(text, fstart, fend, ring, nring, q, len, tgt, tab, &ntab))
+            *has_indirect = 1;
         if (t >= (long)fstart && t < (long)fend) tgt[t - fstart] = 1;
+        if (nring == JT_RING) { memmove(ring, ring + 1, (JT_RING - 1) * sizeof ring[0]); nring--; }
+        ring[nring++] = q;
         q += len;
     }
     return 1;

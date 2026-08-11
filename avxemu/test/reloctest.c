@@ -433,6 +433,80 @@ int main(void) {
         run_decline("lzcnt;branch into footprint (decline)", code, sizeof code);
     }
 
+    /* ---- Jump-table-aware patch safety (fault-storm fix) --------------------
+     * The dominant repeat-faulting sites live in functions whose only indirect
+     * jmp is the bounded LLVM jump-table dispatch:
+     *     cmp rI,imm ; ja default ; lea rB,[rip+tbl] ; movsxd rD,[rB+rI*4] ;
+     *     add rD,rB ; jmp *rD          (table = rel32 entries from tbl base)
+     * collect_branch_targets must RESOLVE that dispatch — enumerate the table's
+     * targets and skip the inline table data — instead of blanket-declining on
+     * has_indirect. Layout of the synthetic function (offsets):
+     *   0: lzcnt edi,edi   (4B faulting site; jmp footprint [0,5))
+     *   4: add  edi,-28    (copyable follower -> window = 7 bytes)
+     *   7: cmp  edi,3
+     *  10: ja   +16 -> 28  (default, past the dispatch)
+     *  12: lea  rax,[rip+13] -> table at 32
+     *  19: movsxd rdi,[rax+rdi*4]
+     *  23: add  rdi,rax
+     *  26: jmp *rdi
+     *  28: ret            (default + all table targets)
+     *  29: int3 pad
+     *  32: table[4] = rel32 entries (28-32 = -4 each)                     */
+    {
+        static const uint8_t code[] = {
+            0xF3, 0x0F, 0xBD, 0xFF,                    /*  0: lzcnt edi,edi */
+            0x83, 0xC7, 0xE4,                          /*  4: add edi,-28 */
+            0x83, 0xFF, 0x03,                          /*  7: cmp edi,3 */
+            0x77, 0x10,                                /* 10: ja +16 -> 28 */
+            0x48, 0x8D, 0x05, 0x0D, 0x00, 0x00, 0x00,  /* 12: lea rax,[rip+13] -> 32 */
+            0x48, 0x63, 0x3C, 0xB8,                    /* 19: movsxd rdi,[rax+rdi*4] */
+            0x48, 0x01, 0xC7,                          /* 23: add rdi,rax */
+            0xFF, 0xE7,                                /* 26: jmp *rdi */
+            0xC3,                                      /* 28: ret */
+            0xCC, 0xCC, 0xCC,                          /* 29: pad */
+            0xFC, 0xFF, 0xFF, 0xFF,                    /* 32: tbl[0] -> 28 */
+            0xFC, 0xFF, 0xFF, 0xFF,                    /* 36: tbl[1] -> 28 */
+            0xFC, 0xFF, 0xFF, 0xFF,                    /* 40: tbl[2] -> 28 */
+            0xFC, 0xFF, 0xFF, 0xFF,                    /* 44: tbl[3] -> 28 */
+        };
+        run_case("lzcnt in jump-table fn (ok)", code, sizeof code);
+    }
+
+    /* Same function, but table entry 2 targets offset 2 — INSIDE the jmp
+     * footprint (0,5). The resolver must mark it and patch_safe must decline. */
+    {
+        static const uint8_t code[] = {
+            0xF3, 0x0F, 0xBD, 0xFF,                    /*  0: lzcnt edi,edi */
+            0x83, 0xC7, 0xE4,                          /*  4: add edi,-28 */
+            0x83, 0xFF, 0x03,                          /*  7: cmp edi,3 */
+            0x77, 0x10,                                /* 10: ja +16 -> 28 */
+            0x48, 0x8D, 0x05, 0x0D, 0x00, 0x00, 0x00,  /* 12: lea rax,[rip+13] -> 32 */
+            0x48, 0x63, 0x3C, 0xB8,                    /* 19: movsxd rdi,[rax+rdi*4] */
+            0x48, 0x01, 0xC7,                          /* 23: add rdi,rax */
+            0xFF, 0xE7,                                /* 26: jmp *rdi */
+            0xC3,                                      /* 28: ret */
+            0xCC, 0xCC, 0xCC,                          /* 29: pad */
+            0xFC, 0xFF, 0xFF, 0xFF,                    /* 32: tbl[0] -> 28 */
+            0xFC, 0xFF, 0xFF, 0xFF,                    /* 36: tbl[1] -> 28 */
+            0xE2, 0xFF, 0xFF, 0xFF,                    /* 40: tbl[2] -> 2 (in footprint!) */
+            0xFC, 0xFF, 0xFF, 0xFF,                    /* 44: tbl[3] -> 28 */
+        };
+        run_decline("jump-table entry into footprint (decline)", code, sizeof code);
+    }
+
+    /* An UNRESOLVABLE indirect jmp (no lea/movsxd table pattern) must still
+     * blanket-decline: has_indirect stays set, patch_safe returns 0. */
+    {
+        static const uint8_t code[] = {
+            0xF3, 0x0F, 0xBD, 0xFF,   /* 0: lzcnt edi,edi */
+            0x83, 0xC7, 0xE4,         /* 4: add edi,-28 (window ok) */
+            0x48, 0x89, 0xC7,         /* 7: mov rdi,rax */
+            0xFF, 0xE7,               /* 10: jmp *rdi (unresolvable) */
+            0xC3,                     /* 12: ret */
+        };
+        run_decline("unresolvable indirect (decline)", code, sizeof code);
+    }
+
     /* ---- Task B: inline native lowerings, oracle-gated vs bmi_exec ----------
      * Each template's faulting op is relocated and must run through the INLINE
      * native sequence (asserted via avxemu_reloc_inlined), matching bmi_exec's
