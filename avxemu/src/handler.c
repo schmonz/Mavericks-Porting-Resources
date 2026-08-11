@@ -441,6 +441,13 @@ int avxemu_emulate(const decoded *d, avxemu_regfile *rf) {
     if (!vec_exec(d->op, d->type, &A, &B, &C, d->imm, &OUT, &gpr_out)) return 0;
 
     if (d->dst_kind == DST_GPR) {
+        /* VPMOVMSKB r32, xmm (VEX.128) yields a 16-bit mask with the upper bits
+         * zeroed; vec_exec always packs 32 bits (lo | hi<<16), where the hi half
+         * is the stale upper 128 of the source ymm. Drop it for the 128-bit form
+         * (same upper-zeroing the vector-dst path does when !wide). Without this,
+         * scan loops (vpcmpeqb; vpmovmskb; bsf/test) see phantom high bits and
+         * never terminate — the same failure family as the 16-bit lzcnt bug. */
+        if (d->op == VPMOVMSKB && !d->wide) gpr_out &= 0xFFFFu;
         rf->gpr[d->dst] = gpr_out;
     } else if (d->dst_kind == DST_MEM) {
         uint64_t a = ea_rf(d, rf, rip_next); MEMWR(a, OUT.b, d->mem_bytes);
