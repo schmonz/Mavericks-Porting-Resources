@@ -7,7 +7,12 @@
  * first (see macho_grow.h) — that resize only works on a PIE executable and is
  * rejected otherwise.
  *
- * Usage: change_dylib input [-grow] [-change old new] [-delete path] [-reexport path]...
+ * Usage: change_dylib input [-grow] [-change old new] [-delete path] [-reexport path] [-add path]...
+ *
+ * -add appends a brand-new LC_LOAD_DYLIB naming `path` (combine with -grow to
+ * guarantee header room). Used to bake a dependency — e.g. libavxemu.dylib —
+ * into the binary itself, so only that binary loads it (not children inheriting
+ * DYLD_INSERT_LIBRARIES). See HEADER_PAD_GROWTH.md.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +39,7 @@ struct change {
  * header pad has been grown). `verbose` prints the per-change diagnostics once.
  */
 static void build_lcs(const uint8_t *buf, const struct change *changes, int nchanges,
+                      const char *const *adds, int nadds,
                       uint8_t *new_lcs, uint32_t *out_off, uint32_t *out_ncmds,
                       int *out_mods, int verbose) {
     const struct mach_header_64 *hdr = (const struct mach_header_64 *)buf;
@@ -92,6 +98,27 @@ static void build_lcs(const uint8_t *buf, const struct change *changes, int ncha
         lcp += cmdsize;
     }
 
+    /* Append brand-new LC_LOAD_DYLIB commands (-add). Each is a dylib_command
+     * (name lc_str, timestamp, versions) followed by the NUL-terminated path,
+     * the whole thing padded to 8 bytes. */
+    for (int a = 0; a < nadds; a++) {
+        size_t plen = strlen(adds[a]) + 1;
+        uint32_t cs = (uint32_t)((sizeof(struct dylib_command) + plen + 7) & ~7UL);
+        struct dylib_command *ndc = (struct dylib_command *)(new_lcs + new_off);
+        memset(ndc, 0, cs);
+        ndc->cmd = LC_LOAD_DYLIB;
+        ndc->cmdsize = cs;
+        ndc->dylib.name.offset = sizeof(struct dylib_command);
+        ndc->dylib.timestamp = 2;            /* conventional (matches install_name_tool) */
+        ndc->dylib.current_version = 0;
+        ndc->dylib.compatibility_version = 0;
+        strcpy((char *)ndc + sizeof(struct dylib_command), adds[a]);
+        new_off += cs;
+        ncmds++;
+        mods++;
+        if (verbose) printf("  Add [%u bytes]: LC_LOAD_DYLIB %s\n", cs, adds[a]);
+    }
+
     *out_off = new_off;
     *out_ncmds = ncmds;
     *out_mods = mods;
@@ -99,18 +126,23 @@ static void build_lcs(const uint8_t *buf, const struct change *changes, int ncha
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s input [-grow] [-change old new] [-delete path] ...\n", argv[0]);
+        fprintf(stderr, "Usage: %s input [-grow] [-change old new] [-delete path] [-reexport path] [-add path] ...\n", argv[0]);
         return 1;
     }
     const char *path = argv[1];
 
     struct change changes[32];
     int nchanges = 0;
+    const char *adds[32];
+    int nadds = 0;
     int allow_grow = 0;
     for (int i = 2; i < argc; ) {
         if (strcmp(argv[i], "-grow") == 0) {
             allow_grow = 1;
             i += 1;
+        } else if (strcmp(argv[i], "-add") == 0 && i + 1 < argc) {
+            adds[nadds++] = argv[i+1];
+            i += 2;
         } else if (strcmp(argv[i], "-change") == 0 && i + 2 < argc) {
             changes[nchanges].old_path = argv[i+1];
             changes[nchanges].new_path = argv[i+2];
@@ -148,10 +180,16 @@ int main(int argc, char **argv) {
     printf("Header pad: %u bytes available (LC end=%u, first sect=%u)\n",
            pad_avail, cur_lc_end, first_sect_off);
 
+    /* Upper bound on bytes the -add commands contribute, so the scratch buffer
+     * can hold the full new table even before the header pad is grown. */
+    uint32_t add_bytes = 0;
+    for (int a = 0; a < nadds; a++)
+        add_bytes += (uint32_t)((sizeof(struct dylib_command) + strlen(adds[a]) + 1 + 7) & ~7UL);
+
     /* Build the new table once to learn its size (and print diagnostics). */
-    uint8_t *new_lcs = calloc(1, first_sect_off);
+    uint8_t *new_lcs = calloc(1, first_sect_off + add_bytes + 64);
     uint32_t new_off, new_ncmds; int modifications;
-    build_lcs(buf, changes, nchanges, new_lcs, &new_off, &new_ncmds, &modifications, 1);
+    build_lcs(buf, changes, nchanges, adds, nadds, new_lcs, &new_off, &new_ncmds, &modifications, 1);
 
     if (modifications == 0) { printf("No matching dylibs found.\n"); return 0; }
 
@@ -181,8 +219,8 @@ int main(int argc, char **argv) {
         /* Rebuild against the relocated header so segment/linkedit offsets in
          * the copied load commands reflect the shift. */
         free(new_lcs);
-        new_lcs = calloc(1, first_sect_off);
-        build_lcs(buf, changes, nchanges, new_lcs, &new_off, &new_ncmds, &modifications, 0);
+        new_lcs = calloc(1, first_sect_off + add_bytes + 64);
+        build_lcs(buf, changes, nchanges, adds, nadds, new_lcs, &new_off, &new_ncmds, &modifications, 0);
     }
 
     /* Commit: zero the whole LC area, write the new table, fix up the header. */
