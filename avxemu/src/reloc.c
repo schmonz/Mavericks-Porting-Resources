@@ -432,14 +432,17 @@ static int patch_site_jmp(uint8_t *site, int64_t srel){
  * (tramp.c) before patching, which scans the containing function's branch targets
  * and declines if any lands in the open interval (site, site+5). So the inbound-
  * branch guarantee is enforced here, not pushed onto the caller. */
+int avxemu_reloc_last_reason;   /* diagnostic: why the last relocate declined (AVXEMU_FAULTHIST) */
+#define RELOC_DECLINE(r) do { avxemu_reloc_last_reason = (r); return 0; } while (0)
+
 int avxemu_relocate_block(uint8_t *site) {
-    if (!ensure_pool(site)) return 0;
+    if (!ensure_pool(site)) RELOC_DECLINE(1);
 
     /* decode the faulting instruction */
     decoded fd;
     int fl = decode(site, &fd);
-    if (fl <= 0 || fd.op == 0) return 0;
-    if (!block_faults(&fd)) return 0;
+    if (fl <= 0 || fd.op == 0) RELOC_DECLINE(2);
+    if (!block_faults(&fd)) RELOC_DECLINE(3);
 
     /* build the window [site,end): walk WHOLE following instructions until >=5
      * bytes; each added instruction must be safely copyable (position-independent) */
@@ -448,14 +451,14 @@ int avxemu_relocate_block(uint8_t *site) {
     while ((size_t)(end - site) < 5) {
         int zk, off;
         int l = x86_len(end, lim, &zk, &off);
-        if (l <= 0) return 0;
-        if (!safe_copyable(end, lim, l)) return 0;
+        if (l <= 0) RELOC_DECLINE(4);
+        if (!safe_copyable(end, lim, l)) RELOC_DECLINE(4);
         end += l;
-        if ((size_t)(end - site) > WINDOW_LIM) return 0;
+        if ((size_t)(end - site) > WINDOW_LIM) RELOC_DECLINE(4);
     }
     /* the 5-byte jmp we write at the site must stay within the relocated window
      * (bytes [site+1,site+5) inside the gathered instruction boundaries) */
-    if ((size_t)(end - site) < 5) return 0;
+    if ((size_t)(end - site) < 5) RELOC_DECLINE(4);
 
     /* Window patch-safety (Part 3): the 5-byte jmp we write clobbers [site,site+5).
      * If any branch ELSEWHERE in the program targets an address in the open interval
@@ -463,7 +466,7 @@ int avxemu_relocate_block(uint8_t *site) {
      * corrupt that entry path. Decline if we cannot PROVE no such target exists.
      * Declining here (the site keeps faulting/emulating, no corruption) is the safe
      * floor — we never trade correctness for speed. */
-    if (!avxemu_patch_safe(site, 5)) return 0;
+    if (!avxemu_patch_safe(site, 5)) RELOC_DECLINE(5);
 
     size_t legal_len = (size_t)(end - (site + fl));
 
@@ -476,16 +479,16 @@ int avxemu_relocate_block(uint8_t *site) {
         if (emit_lowering(&lp, &fd)) {
             size_t low_len = (size_t)(lp - lbuf);
             uint8_t *blk = avxemu_pool_alloc(low_len + legal_len + 5);
-            if (!blk) return 0;
+            if (!blk) RELOC_DECLINE(6);
             int64_t srel = (int64_t)(blk - (site + 5));
-            if (!in_i32(srel)) return 0;
+            if (!in_i32(srel)) RELOC_DECLINE(7);
             memcpy(blk, lbuf, low_len);
             if (legal_len) memcpy(blk + low_len, site + fl, legal_len);
             uint8_t *jb = blk + low_len + legal_len;
             int64_t jrel = (int64_t)((uint8_t *)end - (jb + 5));
-            if (!in_i32(jrel)) return 0;
+            if (!in_i32(jrel)) RELOC_DECLINE(7);
             jb[0] = 0xE9; { int32_t r32 = (int32_t)jrel; memcpy(jb + 1, &r32, 4); }
-            if (!patch_site_jmp(site, srel)) return 0;
+            if (!patch_site_jmp(site, srel)) RELOC_DECLINE(8);
             avxemu_reloc_inlined++;
             return 1;
         }
@@ -496,11 +499,11 @@ int avxemu_relocate_block(uint8_t *site) {
     size_t recsz = sizeof(run_record) + sizeof(tramp_insn);
     uint8_t *stub = avxemu_pool_alloc(code + recsz);
     uint8_t *tail = avxemu_pool_alloc(legal_len + 5);
-    if (!stub || !tail) return 0;
+    if (!stub || !tail) RELOC_DECLINE(6);
 
     /* site -> stub must be a reachable rel32 jmp */
     int64_t srel = (int64_t)(stub - (site + 5));
-    if (!in_i32(srel)) return 0;
+    if (!in_i32(srel)) RELOC_DECLINE(7);
 
     /* (a) stub: copy the tt template verbatim, wire dispatch + resume, append the
      * 1-instruction run_record for the faulting op (run via avxemu_emulate). */
@@ -516,10 +519,10 @@ int avxemu_relocate_block(uint8_t *site) {
     if (legal_len) memcpy(tail, site + fl, legal_len);
     uint8_t *jb = tail + legal_len;
     int64_t jrel = (int64_t)((uint8_t *)end - (jb + 5));
-    if (!in_i32(jrel)) return 0;
+    if (!in_i32(jrel)) RELOC_DECLINE(7);
     jb[0] = 0xE9; { int32_t r32 = (int32_t)jrel; memcpy(jb + 1, &r32, 4); }
 
     /* (c) patch the site with `jmp rel32 -> stub` (writable -> write -> executable). */
-    if (!patch_site_jmp(site, srel)) return 0;
+    if (!patch_site_jmp(site, srel)) RELOC_DECLINE(8);
     return 1;
 }

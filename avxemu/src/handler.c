@@ -18,10 +18,13 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <fcntl.h>       /* open() in faulthist_dump */
+#include <stdio.h>       /* rename() in faulthist_dump */
 #ifndef MAP_ANON
 #define MAP_ANON 0x1000   /* hidden under strict _XOPEN_SOURCE on macOS */
 #endif
 #include <mach/mach.h>
+#include <mach/mach_time.h>  /* mach_absolute_time() in faultsnap_dump */
 #include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
@@ -47,6 +50,109 @@ static int g_owned_sigill = 0;          /* our SIGILL handler is installed */
 #define HOT_THRESHOLD 50          /* faults at one RIP before we relocate it */
 static struct { uint64_t rip; uint32_t n; } g_hot[HOT_SLOTS];
 static int g_reloc_enabled = 1;   /* AVXEMU_RELOC=0 disables (A/B) */
+
+/* AVXEMU_FAULTHIST=1 diagnostic: periodically dump the g_hot RIP->count table
+ * (i.e. every site still faulting into the handler) to /tmp/faulthist.out so a
+ * live spin can be probed for WHICH sites fault repeatedly (eager-scan misses,
+ * relocation declines, JIT-emitted code). Async-signal-safe: open/write/close
+ * + static buffers only, atomic rename like ophist. */
+static int g_faulthist_on = -1;
+static uint64_t g_faulthist_total;
+static int faulthist_enabled(void){
+    if (g_faulthist_on < 0){ const char *e = getenv("AVXEMU_FAULTHIST"); g_faulthist_on = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return g_faulthist_on;
+}
+static void fh_u64(int fd, uint64_t v){
+    char b[24]; int i = 24;
+    if (v == 0){ (void)write(fd, "0", 1); return; }
+    while (v){ b[--i] = (char)('0' + (v % 10)); v /= 10; }
+    (void)write(fd, b + i, (size_t)(24 - i));
+}
+static void fh_hex(int fd, uint64_t v){
+    char b[18]; int i = 18;
+    if (v == 0){ (void)write(fd, "0x0", 3); return; }
+    while (v){ int d = (int)(v & 0xF); b[--i] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v >>= 4; }
+    b[--i] = 'x'; b[--i] = '0';
+    (void)write(fd, b + i, (size_t)(18 - i));
+}
+/* AVXEMU_FAULTSNAP: register+string snapshot from inside the handler. */
+static int g_faultsnap_on = -1;
+static uint64_t g_faultsnap_total;
+static int faultsnap_enabled(void){
+    if (g_faultsnap_on < 0){ const char *e = getenv("AVXEMU_FAULTSNAP"); g_faultsnap_on = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return g_faultsnap_on;
+}
+static uint64_t *gpr_ptr(_STRUCT_X86_THREAD_STATE64 *ss, int i);   /* defined below */
+static void faultsnap_dump(uint64_t rip, _STRUCT_X86_THREAD_STATE64 *ss){
+    int fd = open("/tmp/faultsnap.out", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    /* seq + monotonic time in the header so recurrence ACROSS the run is measurable */
+    (void)write(fd, "--- snap ", 9); fh_u64(fd, g_faultsnap_total);
+    (void)write(fd, " t ", 3); fh_u64(fd, mach_absolute_time());
+    (void)write(fd, " rip ", 5); fh_hex(fd, rip); (void)write(fd, "\n", 1);
+    for (int i = 0; i < 16; i++){
+        uint64_t v = *gpr_ptr(ss, i);
+        (void)write(fd, "r", 1); fh_u64(fd, (uint64_t)i); (void)write(fd, "=", 1); fh_hex(fd, v);
+        /* plausible user pointer? try a guarded read and print printable runs */
+        if (v >= 0x100000000ull && v < 0x800000000000ull){
+            uint8_t buf[128]; mach_vm_size_t got = 0;
+            if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(v & ~0xFull),
+                                       sizeof buf, (mach_vm_address_t)(uintptr_t)buf, &got) == KERN_SUCCESS && got == sizeof buf){
+                int run = 0;
+                for (int k = 0; k <= (int)sizeof buf; k++){
+                    int printable = k < (int)sizeof buf && buf[k] >= 0x20 && buf[k] < 0x7F;
+                    if (printable) run++;
+                    else {
+                        if (run >= 6){ (void)write(fd, " \"", 2); (void)write(fd, buf + k - run, (size_t)run); (void)write(fd, "\"", 1); }
+                        run = 0;
+                    }
+                }
+            }
+        }
+        (void)write(fd, "\n", 1);
+    }
+    close(fd);
+}
+
+/* declined-relocation log: (rip, reason) recorded once per site when hot_bump
+ * fires and avxemu_relocate_block returns 0. Reasons (reloc.c RELOC_DECLINE):
+ * 1=pool-init 2=decode 3=not-faulting 4=window 5=patch-safety 6=pool-alloc
+ * 7=rel32-range 8=site-write */
+extern int avxemu_reloc_last_reason;
+static struct { uint64_t rip; int reason; } g_declined[512];
+static int g_ndeclined;
+static void declined_log(uint64_t rip, int reason){
+    if (g_ndeclined < (int)(sizeof g_declined / sizeof g_declined[0]))
+        { g_declined[g_ndeclined].rip = rip; g_declined[g_ndeclined].reason = reason; g_ndeclined++; }
+}
+static void faulthist_dump(void){
+    int fd = open("/tmp/faulthist.out.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    static const char hdr[] = "=== AVXEMU_FAULTHIST: still-faulting RIPs (count desc, top 48) ===\n";
+    (void)write(fd, hdr, sizeof hdr - 1);
+    /* top-48 selection over the fixed table; O(48*4096) compares, diagnostic-only */
+    uint64_t seen_max = ~0ull; uint32_t seen_n = ~0u;
+    for (int rank = 0; rank < 48; rank++){
+        uint32_t bn = 0; uint64_t brip = 0;
+        for (int k = 0; k < HOT_SLOTS; k++){
+            uint32_t n = g_hot[k].n; uint64_t r = g_hot[k].rip;
+            if (!r || n > seen_n || (n == seen_n && r >= seen_max)) continue;
+            if (n > bn || (n == bn && r > brip)){ bn = n; brip = r; }
+        }
+        if (!brip) break;
+        fh_hex(fd, brip); (void)write(fd, "\t", 1); fh_u64(fd, bn); (void)write(fd, "\n", 1);
+        seen_n = bn; seen_max = brip;
+    }
+    (void)write(fd, "TOTAL_FAULTS\t", 13); fh_u64(fd, g_faulthist_total); (void)write(fd, "\n", 1);
+    static const char dh[] = "=== relocation DECLINES (rip, reason: 1=pool-init 2=decode 3=not-faulting 4=window 5=patch-safety 6=pool-alloc 7=rel32 8=site-write) ===\n";
+    (void)write(fd, dh, sizeof dh - 1);
+    for (int i = 0; i < g_ndeclined; i++){
+        fh_hex(fd, g_declined[i].rip); (void)write(fd, "\tR", 2);
+        fh_u64(fd, (uint64_t)g_declined[i].reason); (void)write(fd, "\n", 1);
+    }
+    close(fd);
+    (void)rename("/tmp/faulthist.out.tmp", "/tmp/faulthist.out");
+}
 static int hot_bump(uint64_t rip) {     /* returns 1 exactly when count crosses threshold */
     uint32_t i = (uint32_t)((rip * 0x9e3779b97f4a7c15ull) >> 52) & (HOT_SLOTS - 1);
     for (int probe = 0; probe < 8; probe++) {
@@ -463,6 +569,16 @@ static void on_sigill(int sig, siginfo_t *info, void *uctx) {
     if (!decode(bp, &d)) { chain(sig, info, uctx); return; }   /* genuine #UD: let it surface */
     uint64_t rip_next = base + d.len;
 
+    /* AVXEMU_FAULTHIST diagnostic: snapshot the still-faulting-RIP table periodically */
+    if (faulthist_enabled() && ((++g_faulthist_total & 0x7FFF) == 0)) faulthist_dump();
+
+    /* AVXEMU_FAULTSNAP diagnostic: every 1024th fault, dump rip + GPRs and any
+     * printable string data the pointer-looking registers reach (vm_read-guarded,
+     * in-process — works where a debugger can't attach through the fault stream).
+     * Identifies WHAT data the hot loop is chewing on. */
+    if (faultsnap_enabled() && ((++g_faultsnap_total & 0x3FF) == 0))
+        faultsnap_dump(base, ss);
+
     /*
      * Fault-driven relocation — relocate BEFORE emulate. Once `base` has trapped
      * HOT_THRESHOLD times, overwrite [base, base+5) with a `jmp rel32` into a
@@ -498,6 +614,7 @@ static void on_sigill(int sig, siginfo_t *info, void *uctx) {
             return;
         }
         /* relocation declined -> fall through and emulate this instance normally */
+        if (faulthist_enabled()) declined_log(base, avxemu_reloc_last_reason);
     }
 
     /* Snapshot the signal's machine state into a register-file, run the shared
