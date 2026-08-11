@@ -37,6 +37,27 @@ static struct sigaction g_old;
 static int g_owned_sigill = 0;          /* our SIGILL handler is installed */
 
 /*
+ * Fault-driven relocation trigger (Task C). A 4-byte isolated scalar BMI op that
+ * the eager trampoliner couldn't patch (no room for a 5-byte jmp) keeps trapping
+ * forever at ~57us/round-trip. We count #UDs per RIP and, once a RIP crosses a
+ * threshold, relocate its block (avxemu_relocate_block) so it stops faulting. The
+ * table is a fixed open-addressed RIP->count map (no allocation in the handler).
+ */
+#define HOT_SLOTS 4096
+#define HOT_THRESHOLD 50          /* faults at one RIP before we relocate it */
+static struct { uint64_t rip; uint32_t n; } g_hot[HOT_SLOTS];
+static int g_reloc_enabled = 1;   /* AVXEMU_RELOC=0 disables (A/B) */
+static int hot_bump(uint64_t rip) {     /* returns 1 exactly when count crosses threshold */
+    uint32_t i = (uint32_t)((rip * 0x9e3779b97f4a7c15ull) >> 52) & (HOT_SLOTS - 1);
+    for (int probe = 0; probe < 8; probe++) {
+        uint32_t k = (i + probe) & (HOT_SLOTS - 1);
+        if (g_hot[k].rip == rip) return ++g_hot[k].n == HOT_THRESHOLD;
+        if (g_hot[k].rip == 0)   { g_hot[k].rip = rip; g_hot[k].n = 1; return HOT_THRESHOLD == 1; }
+    }
+    return 0;
+}
+
+/*
  * The genuine libc sigaction. dlsym is unusable: dyld applies our own
  * interposition to *every* symbol resolution (RTLD_NEXT and explicit handles
  * alike) and hands back avxemu_sigaction, which would recurse forever. The real
@@ -442,6 +463,43 @@ static void on_sigill(int sig, siginfo_t *info, void *uctx) {
     if (!decode(bp, &d)) { chain(sig, info, uctx); return; }   /* genuine #UD: let it surface */
     uint64_t rip_next = base + d.len;
 
+    /*
+     * Fault-driven relocation — relocate BEFORE emulate. Once `base` has trapped
+     * HOT_THRESHOLD times, overwrite [base, base+5) with a `jmp rel32` into a
+     * relocated block that runs the op (natively/emulated) and jumps back.
+     *
+     * Why re-enter at `base` (not rip_next): the jmp we just wrote lives AT base
+     * and MUST execute. Advancing RIP would skip it; worse, for a 4-byte faulting
+     * op rip_next = base+4 lands on the LAST byte of the 5-byte E9 jmp, so the
+     * kernel would resume one byte INSIDE the jmp and decode garbage (a
+     * deterministic crash on the 50th hit of every such site). Re-entering at base
+     * runs the op exactly once, via the patched jmp.
+     *
+     * Why relocate-before-emulate (not emulate -> write back -> rip=base): that
+     * naive ordering DOUBLE-APPLIES dst==src ops. E.g. `tzcnt eax,eax`: emulate
+     * sets eax=f(eax_orig), then re-entering the relocated block computes
+     * f(f(eax_orig)). By relocating first and NOT emulating on success, the op
+     * runs exactly once.
+     *
+     * avxemu_relocate_block reads only the instruction bytes at base (it
+     * re-decodes and emits code); it never needs the emulated result, so calling
+     * it before emulation is correct. If it declines (unsafe site, non-relocatable
+     * op, or pool exhausted) we fall through and emulate this instance normally — a
+     * declined site keeps faulting + emulating forever (the safe floor).
+     *
+     * Gating matches the old post-write-back trigger, just moved earlier: reached
+     * only on the normal emulated path (the cpuid trap and every unrecognised-#UD
+     * chain() return earlier), using the real faulting address `base`. hot_bump
+     * fires once per site.
+     */
+    if (g_reloc_enabled && hot_bump(base)) {
+        if (avxemu_relocate_block((uint8_t *)base)) {
+            ss->__rip = (uint64_t)base;   /* re-enter: the patched jmp runs the op once */
+            return;
+        }
+        /* relocation declined -> fall through and emulate this instance normally */
+    }
+
     /* Snapshot the signal's machine state into a register-file, run the shared
      * core, and write the (possibly modified) state back. The same core runs
      * from the trampoline path, so there is exactly one emulation code path. */
@@ -522,6 +580,10 @@ static void avxemu_install(void) {
         return;
     }
     g_owned_sigill = 1;
+
+    /* Fault-driven relocation is on by default; AVXEMU_RELOC=0 disables it so the
+     * A/B harness can compare emulate-only vs relocate. */
+    { const char *r = getenv("AVXEMU_RELOC"); if (r) g_reloc_enabled = (r[0] != '0'); }
 
     /* Advertise AVX2 + BMI1/BMI2 through a trapped cpuid so the target program
      * takes its AVX2 code path (whose faulting instructions we emulate) rather

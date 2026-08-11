@@ -122,6 +122,17 @@ int avxemu_pool_init(void *hint, size_t cap) {
 void *avxemu_pool_base(void){ return g_pool; }
 size_t avxemu_pool_used(void){ return g_used; }
 
+/* Raw 16-byte-aligned bump allocation from the shared pool. This is the SINGLE
+ * cursor (g_used) over g_pool: the eager trampoliner (build_thunk_t below) and the
+ * runtime relocator (reloc.c) both allocate through it, so the two can never hand
+ * out overlapping bytes of the live pool. Returns NULL if uninitialized/exhausted. */
+void *avxemu_pool_alloc(size_t n) {
+    n = (n + 15) & ~(size_t)15;
+    if (!g_pool || g_used + n > g_cap) return 0;
+    uint8_t *p = g_pool + g_used; g_used += n;
+    return p;
+}
+
 /*
  * Build a thunk for a run of n decoded instructions (each with its original
  * address) that resumes at `resume`. Returns the thunk entry, or NULL if the
@@ -133,10 +144,8 @@ static void *build_thunk_t(const tramp_insn *insns, int n, uint64_t resume,
                            void *dispatch_fn) {
     size_t code  = (size_t)(trecord - tstart);                     /* code + 2 ptr slots */
     size_t recsz = sizeof(run_record) + (size_t)n * sizeof(tramp_insn);
-    size_t need  = (code + recsz + 15) & ~(size_t)15;
-    if (!g_pool || g_used + need > g_cap) return 0;
-
-    uint8_t *t = g_pool + g_used; g_used += need;
+    uint8_t *t = avxemu_pool_alloc(code + recsz);                   /* shared single cursor */
+    if (!t) return 0;
     memcpy(t, tstart, code);
     *(void   **)(t + (tdispatch - tstart)) = dispatch_fn;
     *(uint64_t *)(t + (tresume   - tstart)) = resume;
@@ -197,6 +206,7 @@ static int run_is_regonly_bmi(const tramp_insn *insns, int n) {
  * -------------------------------------------------------------------------- */
 
 static int g_lack_avx2 = 1, g_lack_fma = 1, g_lack_bmi = 1, g_lack_f16c = 0;
+static int g_force_full = 0;   /* AVXEMU_FULLTHUNK: force the register-saving thunk (correctness probe) */
 
 static int avx2_only_op(vex_op op) {
     switch (op) {
@@ -218,6 +228,7 @@ static int tramp_faults(const decoded *d) {
 }
 
 static void detect_features(void) {
+    g_force_full = getenv("AVXEMU_FULLTHUNK") != 0;
     if (getenv("AVXEMU_FORCETRAMP")) {    /* dev: treat everything emulatable as faulting */
         g_lack_avx2 = g_lack_fma = g_lack_bmi = g_lack_f16c = 1; return;
     }
@@ -253,7 +264,8 @@ static long emit_run(uint8_t *text, size_t fstart, size_t fend,
     if (s < ni && re - offs[s] >= 5) {
         const tramp_insn *ri = insns + s; int rn = ni - s;
         uint64_t res = (uint64_t)(text + re);
-        void *thunk = run_is_regonly_bmi(ri, rn) ? build_thunk_bmi(ri, rn, res)
+        void *thunk = g_force_full                ? avxemu_build_thunk(ri, rn, res)
+                    : run_is_regonly_bmi(ri, rn) ? build_thunk_bmi(ri, rn, res)
                     : run_is_gpr_only(ri, rn)     ? build_thunk_gpr(ri, rn, res)
                     :                               avxemu_build_thunk(ri, rn, res);
         if (thunk) {
@@ -287,6 +299,106 @@ static size_t gather_run(uint8_t *text, size_t fstart, size_t fend, size_t q,
     return p;
 }
 
+/* Pass-1 branch-target collection over one function [fstart,fend) (offsets into
+ * text). Marks tgt[off-fstart]=1 at every in-function direct branch target, and
+ * sets *has_indirect if any indirect jmp is seen. Returns 1 if the function
+ * decoded cleanly to its boundary, 0 on a length-decode desync (caller treats a 0
+ * conservatively). Shared by the eager scanner (scan_function) and the runtime
+ * patch-safety check (avxemu_patch_safe). tgt[] must be caller-allocated, length
+ * >= fend-fstart and pre-zeroed. */
+static int collect_branch_targets(uint8_t *text, size_t fstart, size_t fend,
+                                  uint8_t *tgt, int *has_indirect) {
+    *has_indirect = 0;
+    size_t q = fstart;
+    while (q < fend) {
+        if (fend - q <= 15) { int pad = 1; for (size_t r = q; r < fend; r++) if (text[r]&&text[r]!=0xCC&&text[r]!=0x90){pad=0;break;} if (pad) break; }
+        int zk, o2; int len = x86_len(text + q, text + fend, &zk, &o2);
+        if (len <= 0) return 0;
+        int term; long t; int ind;
+        lde_cflow(text + q, text + fend, len, (long)q, &term, &t, &ind);
+        if (ind) *has_indirect = 1;
+        if (t >= (long)fstart && t < (long)fend) tgt[t - fstart] = 1;
+        q += len;
+    }
+    return 1;
+}
+
+/* ---- function-bounds cache for the runtime patch-safety check (Part 3). Filled
+ * once by install_trampolines from the SAME LC_FUNCTION_STARTS data the eager scan
+ * walks, so avxemu_patch_safe is cheap per call. g_func_starts holds ABSOLUTE
+ * addresses (vmaddr+slide) of every function start inside __text, sorted ascending;
+ * the function containing an address A is [start_i, start_{i+1}) where start_i is
+ * the greatest start <= A (the last function ends at g_text_hi). ----------------- */
+static uint64_t *g_func_starts; static int g_func_count;
+static uint8_t  *g_text_base; static uint64_t g_text_lo, g_text_hi;
+
+/* Branch-target scratch for the patch-safety scan. avxemu_patch_safe now runs
+ * INSIDE the SIGILL handler (on_sigill -> avxemu_relocate_block -> avxemu_patch_safe),
+ * so it must NOT call malloc/free: those are not async-signal-safe and the fault
+ * could have interrupted the allocator mid-update, risking deadlock. A fixed static
+ * map sized to a generous max function span replaces the heap allocation. If a
+ * containing function's span exceeds the cap we DECLINE (return 0, the safe floor).
+ * SINGLE-THREADED: this map is touched only during a patch attempt; the startup
+ * spin this targets is single-threaded main-thread, so concurrent relocation
+ * attempts from multiple threads are out of scope for Milestone A — no locking. */
+#define PATCHSAFE_MAP_MAX (256u * 1024)
+static uint8_t g_patchsafe_map[PATCHSAFE_MAP_MAX];
+
+/* Is it safe to write a `jmplen`-byte jmp at `site`? Decline unless we can PROVE
+ * no branch in the containing function targets the open interval (site, site+jmplen).
+ * Conservative: decline if the layout is unknown, the site is outside scanned text,
+ * the function won't decode cleanly, or it contains an unresolved indirect jmp
+ * (whose target could land anywhere, including inside the jmp footprint). */
+int avxemu_patch_safe(uint8_t *site, int jmplen) {
+    if (!g_func_starts || g_func_count <= 0 || !g_text_base) return 0;  /* layout unknown */
+    if (jmplen <= 1) return 1;
+    uint64_t a = (uint64_t)(uintptr_t)site;
+    if (a < g_text_lo || a >= g_text_hi) return 0;                      /* outside scanned text */
+
+    /* greatest function start <= a */
+    int lo = 0, hi = g_func_count - 1, idx = -1;
+    while (lo <= hi) { int mid = (lo + hi) >> 1;
+        if (g_func_starts[mid] <= a) { idx = mid; lo = mid + 1; } else hi = mid - 1; }
+    if (idx < 0) return 0;
+    uint64_t fstart_abs = g_func_starts[idx];
+    uint64_t fend_abs   = (idx + 1 < g_func_count) ? g_func_starts[idx + 1] : g_text_hi;
+    if (fend_abs > g_text_hi) fend_abs = g_text_hi;
+    if (a + (uint64_t)jmplen > fend_abs) return 0;     /* jmp would spill past function end */
+
+    size_t fstart = (size_t)(fstart_abs - g_text_lo);
+    size_t fend   = (size_t)(fend_abs   - g_text_lo);
+    size_t n = fend - fstart;
+    if (n > PATCHSAFE_MAP_MAX) return 0;               /* span exceeds scratch cap -> decline (safe floor) */
+    uint8_t *tgt = g_patchsafe_map;                    /* static scratch: no malloc in the handler */
+    memset(tgt, 0, n);                                 /* collect_branch_targets needs a pre-zeroed map */
+    int has_indirect = 0;
+    int clean = collect_branch_targets(g_text_base, fstart, fend, tgt, &has_indirect);
+    int safe = 1;
+    if (!clean || has_indirect) {
+        safe = 0;                                      /* can't fully account for targets */
+    } else {
+        size_t soff = (size_t)(a - g_text_lo) - fstart;  /* site offset within function */
+        for (int k = 1; k < jmplen; k++) {               /* open interval (site, site+jmplen) */
+            size_t off = soff + (size_t)k;
+            if (off < n && tgt[off]) { safe = 0; break; }
+        }
+    }
+    return safe;
+}
+
+/* Test hook (reloctest): register a single synthetic function [base, base+size)
+ * as the cached layout so avxemu_patch_safe can run against a unit-test buffer not
+ * in the main image's __text. Production NEVER calls this — install_trampolines
+ * populates the cache from LC_FUNCTION_STARTS. */
+void avxemu_patch_safe_test_region(uint8_t *base, size_t size) {
+    static uint64_t one_start;
+    one_start = (uint64_t)(uintptr_t)base;
+    g_func_starts = &one_start; g_func_count = 1;
+    g_text_base = base;
+    g_text_lo = (uint64_t)(uintptr_t)base;
+    g_text_hi = g_text_lo + size;
+}
+
 /*
  * Trampoline one function's faulting runs. A function that decodes cleanly
  * linearly is walked straight through; one that doesn't (embedded jump tables)
@@ -302,22 +414,12 @@ static long scan_function(uint8_t *text, size_t fstart, size_t fend, size_t read
     long patched = 0;
 
     /* pass 1: clean linear decode? collect direct-branch targets + indirect flag */
-    int has_indirect = 0, clean = 1;
-    size_t q = fstart;
-    while (q < fend) {
-        if (fend - q <= 15) { int pad = 1; for (size_t r = q; r < fend; r++) if (text[r]&&text[r]!=0xCC&&text[r]!=0x90){pad=0;break;} if (pad) break; }
-        int zk, o2; int len = x86_len(text + q, text + fend, &zk, &o2);
-        if (len <= 0) { clean = 0; break; }
-        int term; long t; int ind;
-        lde_cflow(text + q, text + fend, len, (long)q, &term, &t, &ind);
-        if (ind) has_indirect = 1;
-        if (t >= (long)fstart && t < (long)fend) tgt[t - fstart] = 1;
-        q += len;
-    }
+    int has_indirect = 0;
+    int clean = collect_branch_targets(text, fstart, fend, tgt, &has_indirect);
 
     if (clean) {
         /* pass 2: walk linearly; trampoline each maximal faulting run */
-        q = fstart;
+        size_t q = fstart;
         while (q < fend) {
             if (fend - q <= 15) { int pad = 1; for (size_t r = q; r < fend; r++) if (text[r]&&text[r]!=0xCC&&text[r]!=0x90){pad=0;break;} if (pad) break; }
             int zk, o2; int len = x86_len(text + q, text + fend, &zk, &o2);
@@ -411,6 +513,30 @@ long avxemu_install_trampolines(void) {
 
     const uint8_t *fp = (const uint8_t *)(le_vm + slide + (fs_off - le_off));
     const uint8_t *fe = fp + fs_size;
+
+    /* Cache function bounds for the runtime patch-safety check (Part 3) from the
+     * SAME LC_FUNCTION_STARTS data the scan loop below walks. Two cheap passes over
+     * the (copied) cursor — count in-__text starts, then record absolute addresses.
+     * fp is left untouched for the scan loop. */
+    g_text_base = text;
+    g_text_lo = (uint64_t)(uintptr_t)text;
+    g_text_hi = g_text_lo + text_size;
+    {
+        const uint8_t *cp = fp; uint64_t ca = tseg_vm; int cnt = 0;
+        while (cp < fe) { uint64_t d = uleb_t(&cp, fe); if (!d) break; ca += d;
+            if (ca >= text_addr && ca < text_addr + text_size) cnt++; }
+        if (cnt > 0) {
+            g_func_starts = (uint64_t *)malloc((size_t)cnt * sizeof(uint64_t));
+            if (g_func_starts) {
+                const uint8_t *cp2 = fp; uint64_t ca2 = tseg_vm; int k = 0;
+                while (cp2 < fe && k < cnt) { uint64_t d = uleb_t(&cp2, fe); if (!d) break; ca2 += d;
+                    if (ca2 >= text_addr && ca2 < text_addr + text_size)
+                        g_func_starts[k++] = ca2 + (uint64_t)slide; }   /* absolute, ascending */
+                g_func_count = k;
+            }
+        }
+    }
+
     uint64_t addr = tseg_vm; uint64_t prev = 0; long total = 0;
     while (fp < fe) {
         uint64_t delta = uleb_t(&fp, fe); if (!delta) break;
