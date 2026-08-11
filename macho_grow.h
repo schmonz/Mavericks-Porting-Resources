@@ -12,7 +12,11 @@
  * load commands. LIEF/llvm push every later segment to a HIGHER vm address and
  * then fix up everything that depended on those addresses — section-symbol
  * n_values, LC_MAIN, function-start deltas, relocations, rebase/bind/chained
- * targets. That is a lot of machinery.
+ * targets. That is a lot of machinery — and we can't just run those tools on
+ * 10.9 anyway: LIEF needs a modern-macOS C++ runtime and llvm-objcopy a
+ * cross-built toolchain, while install_name_tool / optool / insert_dylib refuse
+ * to grow the header at all. This header compiles with the stock 10.9 clang and
+ * has no dependencies.
  *
  * We take a simpler, equivalent route available to any PIE executable with a
  * __PAGEZERO: instead of raising data, we LOWER the image base. We donate the
@@ -73,6 +77,78 @@ static uint32_t mg_first_sect_off(const uint8_t *buf) {
 /* Shift one file-offset field down by `grow` if it points at/after `insert`. */
 static void mg_bump(uint32_t *off, uint32_t insert, uint32_t grow) {
     if (*off >= insert) *off += grow;
+}
+
+/* ---- ULEB128, for the LC_FUNCTION_STARTS leading-delta re-encode ----------
+ *
+ * LC_FUNCTION_STARTS is a stream of ULEB128 deltas: the FIRST is relative to the
+ * image base, the rest are function-to-function. Lowering the image base by N
+ * (the grow trick) leaves every function's VM address fixed, so the later deltas
+ * are unchanged, but the first must gain N or every reconstructed function
+ * address comes out N low. We adjust it in place, preserving its byte width so
+ * the blob — and all of __LINKEDIT after it — never moves. (When the widened
+ * delta would need more bytes than the original encoding, we refuse rather than
+ * resize LINKEDIT; see mg_grow_header.) */
+
+/* Decode one ULEB128 at p (< end). Returns bytes consumed, 0 if malformed
+ * (continuation runs past end, or > 10 bytes). *out = value. */
+static int mg_uleb_decode(const uint8_t *p, const uint8_t *end, uint64_t *out) {
+    uint64_t r = 0; int s = 0, n = 0;
+    while (p + n < end && n < 10) {
+        uint8_t b = p[n]; r |= (uint64_t)(b & 0x7f) << s; n++;
+        if (!(b & 0x80)) { *out = r; return n; }
+        s += 7;
+    }
+    return 0;
+}
+
+/* Minimal number of bytes to ULEB-encode v (>= 1). */
+static int mg_uleb_minlen(uint64_t v) {
+    int n = 1; while (v >= 0x80) { v >>= 7; n++; } return n;
+}
+
+/* Encode v into exactly `width` ULEB128 bytes at p, padding non-minimally with
+ * continuation groups if width exceeds the minimal length. Returns 1 on success,
+ * 0 if v does not fit in `width` bytes. */
+static int mg_uleb_encode_fixed(uint8_t *p, uint64_t v, int width) {
+    if (width < 1 || mg_uleb_minlen(v) > width) return 0;
+    for (int i = 0; i < width; i++) {
+        uint8_t b = (uint8_t)((v >> (7 * i)) & 0x7f);
+        if (i < width - 1) b |= 0x80;   /* keep the stream going through the pad */
+        p[i] = b;
+    }
+    return 1;
+}
+
+/* Re-encode the leading (base-relative) LC_FUNCTION_STARTS delta after lowering
+ * the image base by `grow`: delta[0] += grow, keeping the leading delta's byte
+ * width so blob size is unchanged and the trailing deltas are untouched.
+ * Returns: 1 patched in place; 0 the widened delta needs more bytes than the
+ * original leading encoding (caller must refuse — LINKEDIT resize unsupported);
+ * -1 malformed blob (empty / bad leading ULEB). */
+static int mg_reencode_funcstarts_base(uint8_t *blob, uint32_t size, uint32_t grow) {
+    if (size == 0) return -1;
+    uint64_t d0; int n0 = mg_uleb_decode(blob, blob + size, &d0);
+    if (n0 == 0) return -1;
+    uint64_t nd = d0 + grow;
+    if (mg_uleb_minlen(nd) > n0) return 0;          /* would widen -> caller refuses */
+    return mg_uleb_encode_fixed(blob, nd, n0) ? 1 : 0;
+}
+
+/* Decode the whole function-starts blob into absolute addresses given the image
+ * base. Stops at a 0 delta (terminator/padding) or end. Returns count (<= max),
+ * or -1 on a malformed ULEB. (Used by tests to assert the grow moved nothing.) */
+static int mg_funcstarts_decode(const uint8_t *blob, uint32_t size,
+                                uint64_t base, uint64_t *out, int max) {
+    const uint8_t *p = blob, *end = blob + size; uint64_t addr = base; int n = 0;
+    while (p < end && n < max) {
+        uint64_t d; int c = mg_uleb_decode(p, end, &d);
+        if (c == 0) return -1;
+        p += c;
+        if (d == 0) break;
+        addr += d; out[n++] = addr;
+    }
+    return n;
 }
 
 /*
@@ -148,6 +224,44 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
         fprintf(stderr, "macho_grow: need a __PAGEZERO >= %u bytes to lower the image "
                         "base (image-base trick requires a PIE executable)\n", grow);
         return -1;
+    }
+
+    /* Locate LC_FUNCTION_STARTS and confirm its base-relative leading delta can
+     * absorb `grow` without widening its ULEB encoding (the common case for a
+     * page-sized grow). We check BEFORE mutating so a refusal leaves the buffer
+     * untouched. dyld ignores function-starts, but avxemu uses it to find
+     * function bounds for patch-safety; a stale leading delta makes every bound N
+     * low and the emulator declines to patch (a SIGILL storm). fs_dataoff is the
+     * ORIGINAL file offset; after the memmove the blob lives at fs_dataoff+grow. */
+    uint32_t fs_dataoff = 0, fs_datasize = 0;
+    {
+        const uint8_t *sp = buf + sizeof(*hdr);
+        for (uint32_t i = 0; i < hdr->ncmds; i++) {
+            const struct load_command *lc = (const struct load_command *)sp;
+            if (lc->cmd == LC_FUNCTION_STARTS) {
+                const struct linkedit_data_command *ld =
+                    (const struct linkedit_data_command *)sp;
+                fs_dataoff = ld->dataoff; fs_datasize = ld->datasize;
+                break;
+            }
+            sp += lc->cmdsize;
+        }
+    }
+    if (fs_dataoff && fs_datasize) {
+        uint64_t d0; int n0 = mg_uleb_decode(buf + fs_dataoff,
+                                             buf + fs_dataoff + fs_datasize, &d0);
+        if (n0 == 0) {
+            fprintf(stderr, "macho_grow: malformed LC_FUNCTION_STARTS leading delta\n");
+            return -1;
+        }
+        if (mg_uleb_minlen(d0 + grow) > n0) {
+            fprintf(stderr, "macho_grow: grow of %u would widen the LC_FUNCTION_STARTS "
+                            "leading delta (%llu -> %llu crosses a ULEB byte boundary); "
+                            "in-place re-encode impossible and __LINKEDIT resize is not "
+                            "implemented. Use a smaller grow.\n",
+                    grow, (unsigned long long)d0, (unsigned long long)(d0 + grow));
+            return -1;
+        }
     }
 
     /* Insert `grow` zero bytes after the load commands, shifting file data down. */
@@ -238,6 +352,20 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
             break;  /* LC_LOAD_DYLIB/DYLINKER/UUID/VERSION_MIN carry no file offsets */
         }
         lcp += lc->cmdsize;
+    }
+
+    /* Re-encode the base-relative LC_FUNCTION_STARTS leading delta: the base
+     * dropped by `grow`, so the first delta must gain `grow` to keep every
+     * function's absolute address fixed. The blob moved with the memmove; it now
+     * lives at fs_dataoff+grow. The pre-mutation check above already proved the
+     * width is preserved, so this cannot widen — a nonzero return is a bug. */
+    if (fs_dataoff && fs_datasize) {
+        int r = mg_reencode_funcstarts_base(buf + fs_dataoff + grow, fs_datasize, grow);
+        if (r != 1) {
+            fprintf(stderr, "macho_grow: internal error re-encoding function-starts "
+                            "leading delta (r=%d) after passing the width pre-check\n", r);
+            return -1;
+        }
     }
 
     *pbuf = buf;
