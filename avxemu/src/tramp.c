@@ -27,6 +27,12 @@ typedef struct { uint32_t n; uint32_t pad; tramp_insn insns[]; } run_record;
 
 extern char avxemu_tt_start[], avxemu_tt_end[];
 extern char avxemu_tt_dispatchptr[], avxemu_tt_resumeptr[], avxemu_tt_record[];
+/* GPR-only thunk template: saves only xmm0-15 (128-bit) instead of all ymm. */
+extern char avxemu_ttg_start[], avxemu_ttg_end[];
+extern char avxemu_ttg_dispatchptr[], avxemu_ttg_resumeptr[], avxemu_ttg_record[];
+/* BMI reg-only thunk template: saves GPRs+flags only, no vector save at all. */
+extern char avxemu_tt2_start[], avxemu_tt2_end[];
+extern char avxemu_tt2_dispatchptr[], avxemu_tt2_resumeptr[], avxemu_tt2_record[];
 
 static void emit(const char *s){ (void)write(2, s, strlen(s)); }
 
@@ -74,6 +80,34 @@ void avxemu_tramp_dispatch(const run_record *r, avxemu_regfile *rf) {
     avxemu_run_on_stack(side, SIDE_SZ, tramp_emulate_run, r, rf);
 }
 
+/* xmm-CLEAN dispatch for register-only BMI runs. Replicates avxemu_emulate's
+ * is_bmi path but with NO memory operands (so no mem_read/memcpy) and calls
+ * bmi_exec directly -- the whole chain uses only general registers, so it cannot
+ * clobber the program's xmm/ymm. That is what lets the tt2 thunk skip the vector
+ * save entirely. (A build-time `otool | grep xmm` over this + bmi_exec guards the
+ * invariant; the classifier never routes a memory/seg op here.) */
+static int emulate_bmi_reg(const decoded *d, avxemu_regfile *rf) {
+    uint64_t s1 = 0, s2 = 0, dst = 0, dst2 = 0, flags = rf->rflags;
+    if (d->a_src >= 0) s1 = rf->gpr[d->a_src];
+    if (d->bmi_s1_rdx) s1 = rf->gpr[2];
+    if (d->op == BMI_RORX)  s2 = d->imm;
+    else if (d->b_src >= 0) s2 = rf->gpr[d->b_src];
+    if (!bmi_exec(d->op, d->opsize, s1, s2, &dst, &dst2, &flags)) return 0;
+    if (d->dst >= 0)      rf->gpr[d->dst]      = dst;
+    if (d->bmi_dst2 >= 0) rf->gpr[d->bmi_dst2] = dst2;
+    rf->rflags = flags;
+    return 1;
+}
+void avxemu_tramp_dispatch_bmi(const run_record *r, avxemu_regfile *rf) {
+    for (uint32_t i = 0; i < r->n; i++) {
+        rf->rip = r->insns[i].addr;
+        if (!emulate_bmi_reg(&r->insns[i].dec, rf)) {
+            emit("avxemu: tramp dispatch (bmi): emulate failed mid-run\n");
+            return;
+        }
+    }
+}
+
 /* ---- thunk pool: RWX, bump-allocated. The patcher reaches it with jmp rel32,
  * so it must land within +/-2GB of __text; avxemu_pool_init() takes a hint. ---- */
 static uint8_t *g_pool; static size_t g_used, g_cap;
@@ -93,21 +127,67 @@ size_t avxemu_pool_used(void){ return g_used; }
  * address) that resumes at `resume`. Returns the thunk entry, or NULL if the
  * pool is exhausted. Only data slots are written; the template code is verbatim.
  */
-void *avxemu_build_thunk(const tramp_insn *insns, int n, uint64_t resume) {
-    size_t code  = (size_t)(avxemu_tt_record - avxemu_tt_start);   /* code + 2 ptr slots */
+static void *build_thunk_t(const tramp_insn *insns, int n, uint64_t resume,
+                           const char *tstart, const char *trecord,
+                           const char *tdispatch, const char *tresume,
+                           void *dispatch_fn) {
+    size_t code  = (size_t)(trecord - tstart);                     /* code + 2 ptr slots */
     size_t recsz = sizeof(run_record) + (size_t)n * sizeof(tramp_insn);
     size_t need  = (code + recsz + 15) & ~(size_t)15;
     if (!g_pool || g_used + need > g_cap) return 0;
 
     uint8_t *t = g_pool + g_used; g_used += need;
-    memcpy(t, avxemu_tt_start, code);
-    *(void   **)(t + (avxemu_tt_dispatchptr - avxemu_tt_start)) = (void *)avxemu_tramp_dispatch;
-    *(uint64_t *)(t + (avxemu_tt_resumeptr   - avxemu_tt_start)) = resume;
+    memcpy(t, tstart, code);
+    *(void   **)(t + (tdispatch - tstart)) = dispatch_fn;
+    *(uint64_t *)(t + (tresume   - tstart)) = resume;
 
-    run_record *r = (run_record *)(t + (avxemu_tt_record - avxemu_tt_start));
+    run_record *r = (run_record *)(t + (trecord - tstart));
     r->n = (uint32_t)n; r->pad = 0;
     for (int i = 0; i < n; i++) r->insns[i] = insns[i];
     return t;
+}
+
+/* Full thunk: saves all 16 ymm (256-bit). Used for any run with a vector op. */
+void *avxemu_build_thunk(const tramp_insn *insns, int n, uint64_t resume) {
+    return build_thunk_t(insns, n, resume, avxemu_tt_start, avxemu_tt_record,
+                         avxemu_tt_dispatchptr, avxemu_tt_resumeptr,
+                         (void *)avxemu_tramp_dispatch);
+}
+
+/* GPR-only thunk: saves only xmm0-15 (128-bit). SAFE only for runs whose every
+ * instruction is a GPR-domain op (is_bmi: BMI1/2, LZCNT, TZCNT, MOVBE) — those
+ * touch no vector register, so the emulation neither reads nor writes ymm and the
+ * upper 128 bits are left untouched by the SSE-only C path. Halves the per-run
+ * vector spill, the dominant trampoline cost. */
+static void *build_thunk_gpr(const tramp_insn *insns, int n, uint64_t resume) {
+    return build_thunk_t(insns, n, resume, avxemu_ttg_start, avxemu_ttg_record,
+                         avxemu_ttg_dispatchptr, avxemu_ttg_resumeptr,
+                         (void *)avxemu_tramp_dispatch);
+}
+
+/* BMI reg-only thunk: saves GPRs+flags only, no vector save. Dispatched through
+ * the xmm-clean avxemu_tramp_dispatch_bmi, so the program's vector state is
+ * untouched and needs no preservation. */
+static void *build_thunk_bmi(const tramp_insn *insns, int n, uint64_t resume) {
+    return build_thunk_t(insns, n, resume, avxemu_tt2_start, avxemu_tt2_record,
+                         avxemu_tt2_dispatchptr, avxemu_tt2_resumeptr,
+                         (void *)avxemu_tramp_dispatch_bmi);
+}
+
+/* True iff every instruction in the run is a GPR-domain op (no vector reg). */
+static int run_is_gpr_only(const tramp_insn *insns, int n) {
+    for (int i = 0; i < n; i++) if (!insns[i].dec.is_bmi) return 0;
+    return n > 0;
+}
+/* Stricter: every insn is a register-operand BMI op (no memory, no segment) -> the
+ * emulation touches only GPRs, so the no-vector-save tt2 thunk is safe. */
+static int run_is_regonly_bmi(const tramp_insn *insns, int n) {
+    for (int i = 0; i < n; i++) {
+        const decoded *d = &insns[i].dec;
+        if (!d->is_bmi || d->a_src == OPND_MEM || d->b_src == OPND_MEM
+            || d->dst_kind == DST_MEM || d->seg != 0) return 0;
+    }
+    return n > 0;
 }
 
 /* ----------------------------------------------------------------------------
@@ -171,7 +251,11 @@ static long emit_run(uint8_t *text, size_t fstart, size_t fend,
         s++;                                              /* unsafe 4-byte start -> it traps; try next */
     }
     if (s < ni && re - offs[s] >= 5) {
-        void *thunk = avxemu_build_thunk(insns + s, ni - s, (uint64_t)(text + re));
+        const tramp_insn *ri = insns + s; int rn = ni - s;
+        uint64_t res = (uint64_t)(text + re);
+        void *thunk = run_is_regonly_bmi(ri, rn) ? build_thunk_bmi(ri, rn, res)
+                    : run_is_gpr_only(ri, rn)     ? build_thunk_gpr(ri, rn, res)
+                    :                               avxemu_build_thunk(ri, rn, res);
         if (thunk) {
             uint8_t *site = text + offs[s];
             int64_t rel = (int64_t)((uint8_t *)thunk - (site + 5));
