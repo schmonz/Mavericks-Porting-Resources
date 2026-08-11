@@ -96,6 +96,31 @@ __asm__(
  * emits via a native inline lowering (instead of the emulator stub). The BMI cases
  * below assert this advances, proving the INLINE path ran (not the stub). */
 extern int avxemu_reloc_inlined;
+extern int avxemu_reloc_last_reason;
+extern void *avxemu_pool_base(void);
+extern int avxemu_pool_init(void *hint, size_t cap);
+
+/* Test buffers must sit within jmp-rel32 (+/-2GB) of the relocation pool, else
+ * avxemu_relocate_block legitimately declines with reason 7 (rel32 range) and
+ * the round-trip is never exercised. On 10.9 the pool is placed next to the
+ * image and the default mmap(0,...) buffers land close enough by luck. On
+ * macOS 15 the kernel routes the RWX pool to a far zone (~+7.6GB from a
+ * low-hinted buffer) and refuses to co-locate RWX near the image, so every
+ * case failed R7 there. Fix: pre-init the pool once, then mmap each code
+ * buffer with a HINT just past the pool so both live in the same zone and
+ * rel32 always reaches. Placement-only — it does not weaken what is tested
+ * (the relocation/patch logic runs identically wherever the bytes sit). */
+#define RT_POOL_CAP (96u << 20)
+static uint8_t *rt_pool_hint_cursor;
+static void rt_pool_ready(void) {
+    if (avxemu_pool_base()) return;
+    /* hint the pool near this function's own address (in-image on every host) */
+    void *hint = (void *)(((uintptr_t)&rt_pool_ready + 0x100000) & ~(uintptr_t)0xfff);
+    avxemu_pool_init(hint, RT_POOL_CAP);
+    uint8_t *base = (uint8_t *)avxemu_pool_base();
+    /* park buffers a few MB past the pool's end: same zone, no overlap */
+    rt_pool_hint_cursor = base ? base + RT_POOL_CAP + (16u << 20) : 0;
+}
 
 /* Part 3 (Task C) test hook: register a synthetic function [base,base+size) as the
  * cached layout so avxemu_patch_safe runs against these mmap'd buffers (which are
@@ -113,8 +138,18 @@ static void seed(State *s) {
 }
 
 static uint8_t *make_code(const uint8_t *bytes, size_t n) {
-    uint8_t *p = mmap(0, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
-                      MAP_PRIVATE | MAP_ANON, -1, 0);
+    rt_pool_ready();
+    /* try a hint near the pool first (keeps rel32 in range on far-zone hosts);
+     * fall back to any placement if the hint is unavailable/refused. */
+    uint8_t *p = MAP_FAILED;
+    if (rt_pool_hint_cursor) {
+        p = mmap(rt_pool_hint_cursor, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p != MAP_FAILED) rt_pool_hint_cursor += 0x1000;
+    }
+    if (p == MAP_FAILED)
+        p = mmap(0, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED) return 0;
     memset(p, 0xCC, 0x1000);
     memcpy(p, bytes, n);
@@ -153,7 +188,7 @@ static void run_case(const char *name, const uint8_t *bytes, size_t n) {
 
     /* (2) relocate the buffer */
     int r = avxemu_relocate_block(test_buf);
-    if (r != 1) { printf("  [%s] relocate returned %d (expected 1) — FAIL\n", name, r); g_fail++; return; }
+    if (r != 1) { printf("  [%s] relocate returned %d (expected 1, reason %d, site=%p pool=%p) — FAIL\n", name, r, avxemu_reloc_last_reason, (void *)test_buf, avxemu_pool_base()); g_fail++; return; }
 
     /* (3) run the patched buffer */
     memset(&got, 0, sizeof got);
@@ -248,7 +283,7 @@ static void run_bmi_case(const char *name, const uint8_t *bytes, size_t n,
     /* relocate, asserting the INLINE lowering was used (counter advances by 1) */
     int before = avxemu_reloc_inlined;
     int r = avxemu_relocate_block(test_buf);
-    if (r != 1) { printf("  [%s] relocate returned %d (expected 1) — FAIL\n", name, r); g_fail++; return; }
+    if (r != 1) { printf("  [%s] relocate returned %d (expected 1, reason %d, site=%p pool=%p) — FAIL\n", name, r, avxemu_reloc_last_reason, (void *)test_buf, avxemu_pool_base()); g_fail++; return; }
     if (avxemu_reloc_inlined != before + 1) {
         printf("  [%s] inline lowering NOT used (stub fallback) — FAIL\n", name);
         g_fail++; return;
@@ -342,7 +377,7 @@ static void run_stub_case(const char *name, const uint8_t *bytes, size_t n,
     reloc_test_invoke(legal_buf, &mid, &ref);
     int before = avxemu_reloc_inlined;
     int r = avxemu_relocate_block(test_buf);
-    if (r != 1) { printf("  [%s] relocate returned %d (expected 1) — FAIL\n", name, r); g_fail++; return; }
+    if (r != 1) { printf("  [%s] relocate returned %d (expected 1, reason %d, site=%p pool=%p) — FAIL\n", name, r, avxemu_reloc_last_reason, (void *)test_buf, avxemu_pool_base()); g_fail++; return; }
     if (avxemu_reloc_inlined != before) {
         printf("  [%s] expected STUB but inline counter advanced — FAIL\n", name); g_fail++; return;
     }
