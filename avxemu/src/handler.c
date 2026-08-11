@@ -389,7 +389,11 @@ int avxemu_emulate(const decoded *d, avxemu_regfile *rf) {
         if (d->dst_kind == DST_MEM) {
             uint64_t a = ea_rf(d, rf, rip_next); MEMWR(a, &dst, d->mem_bytes);
         } else {
-            if (d->dst >= 0)      rf->gpr[d->dst]      = dst;
+            /* 16-bit ops (66-prefixed lzcnt/tzcnt/movbe) write only the low word
+             * of the dst register on real hardware; 32/64-bit writes zero-extend. */
+            if (d->dst >= 0)      rf->gpr[d->dst] = (d->opsize == 16)
+                                      ? ((rf->gpr[d->dst] & ~0xFFFFull) | (dst & 0xFFFFull))
+                                      : dst;
             if (d->bmi_dst2 >= 0) rf->gpr[d->bmi_dst2] = dst2;
             rf->rflags = flags;
         }

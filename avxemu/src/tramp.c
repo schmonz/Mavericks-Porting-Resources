@@ -154,7 +154,11 @@ static int emulate_bmi_reg(const decoded *d, avxemu_regfile *rf) {
     if (d->op == BMI_RORX)  s2 = d->imm;
     else if (d->b_src >= 0) s2 = rf->gpr[d->b_src];
     if (!bmi_exec(d->op, d->opsize, s1, s2, &dst, &dst2, &flags)) return 0;
-    if (d->dst >= 0)      rf->gpr[d->dst]      = dst;
+    /* 16-bit ops (66-prefixed lzcnt/tzcnt/movbe) write only the low word of the
+     * destination register on real hardware; 32/64-bit writes zero-extend. */
+    if (d->dst >= 0)      rf->gpr[d->dst] = (d->opsize == 16)
+                              ? ((rf->gpr[d->dst] & ~0xFFFFull) | (dst & 0xFFFFull))
+                              : dst;
     if (d->bmi_dst2 >= 0) rf->gpr[d->bmi_dst2] = dst2;
     rf->rflags = flags;
     return 1;

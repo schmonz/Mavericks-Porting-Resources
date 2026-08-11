@@ -99,7 +99,12 @@ static int decode_inner(const uint8_t *p, decoded *d) {
             int reg, rm; int adv = parse_modrm(q+2, rexX, rexB, d, &rm);
             reg = ((q[2]>>3)&7) + (rexR?8:0);
             d->op = (q[1]==0xBC) ? BMI_TZCNT : BMI_LZCNT;
-            d->is_bmi = 1; d->opsize = rexW ? 64 : 32;
+            /* Honor the 66 operand-size prefix: `lzcnt cx,di` / `tzcnt` are 16-bit
+             * ops. Dropping it (opsize forced to 32) mis-emulates a 16-bit lzcnt as
+             * 32-bit — off by +16 when the upper half is zero. That is exactly the
+             * no-AVX2 startup-spin instruction (66 f3 0f bd cf): the wrong result
+             * makes JSC's 16-bit char-search loop never terminate. */
+            d->is_bmi = 1; d->opsize = rexW ? 64 : (has66 ? 16 : 32);
             d->dst = reg; d->dst_kind = DST_GPR;
             d->a_src = (rm<0)?OPND_MEM:rm; d->mem_bytes = d->opsize/8;
             d->len = (uint8_t)((q+2-p) + adv);

@@ -96,6 +96,14 @@ echo "[6g] native-SSE codegen thunk: emitted block vs C emulate (differential or
 # pool itself). No `| tail`, so a mismatch (set -e) stops the build.
 AVXEMU_DISABLE=1 "$OUT/nativetest"
 
+echo "[6h] 16-bit (66-prefixed) lzcnt/tzcnt decode+emulate (the JSC-search spin bug)..."
+"$CC" -O2 -std=c11 -Isrc test/zcnt16.c "$OUT/decode.o" "$OUT/exec_bmi.o" "$OUT/names.o" -o "$OUT/zcnt16" 2>&1 | quiet
+# Hermetic: real instruction bytes -> production decode() -> bmi_exec, checked
+# against hand-computed hardware truth. Pins the 66-prefix opsize fix (a 16-bit
+# lzcnt mis-decoded as 32-bit returned +16-skewed counts -> app-level infinite
+# loop). No `| tail`, so a failure (set -e) stops the build.
+"$OUT/zcnt16" | tail -1
+
 echo "[7] decoder + differential fuzzer vs the real Claude binary (if present)..."
 BINARY="${CLAUDE_BIN:-$HOME/.local/share/claude/versions/2.1.166}"
 if [ -f "$BINARY" ]; then
