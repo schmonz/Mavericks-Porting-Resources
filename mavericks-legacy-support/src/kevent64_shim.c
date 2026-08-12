@@ -95,7 +95,24 @@ static void kq_stash(int kq, const struct kevent64_s *evs, int n) {
     if (slot >= 0) {
         g_kq_pending[slot].kq = kq;
         for (int i = 0; i < n; i++) {
-            if (g_kq_pending[slot].count < MAX_PENDING_PER_KQ) {
+            /* Coalesce by (ident, filter), the way kqueue itself does: one
+             * kevent() call never reports the same filter twice. Appending a
+             * second copy makes the caller act on one readiness notification
+             * twice — for a socket that means a second read of an fd whose
+             * data the first read already consumed, which blocks. Overwrite
+             * so the delivered event carries the newest data/flags. */
+            int dup = -1;
+            for (int j = 0; j < g_kq_pending[slot].count; j++) {
+                if (g_kq_pending[slot].ev[j].ident  == evs[i].ident &&
+                    g_kq_pending[slot].ev[j].filter == evs[i].filter) { dup = j; break; }
+            }
+            if (dup >= 0) {
+                g_kq_pending[slot].ev[dup] = evs[i];
+                tlog("STASH-COALESCE kq=%d slot=%d ident=%llu filter=%d flags=0x%x fflags=0x%x data=%lld (count=%d)",
+                     kq, slot, (unsigned long long)evs[i].ident, evs[i].filter,
+                     evs[i].flags, evs[i].fflags, (long long)evs[i].data,
+                     g_kq_pending[slot].count);
+            } else if (g_kq_pending[slot].count < MAX_PENDING_PER_KQ) {
                 g_kq_pending[slot].ev[g_kq_pending[slot].count++] = evs[i];
                 tlog("STASH kq=%d slot=%d ident=%llu filter=%d flags=0x%x fflags=0x%x data=%lld (count=%d)",
                      kq, slot, (unsigned long long)evs[i].ident, evs[i].filter,
@@ -676,6 +693,30 @@ int kevent64_wrapper(int kq, const struct kevent64_s *changelist, int nchanges,
                 (unsigned long long)eventlist[i].udata);
     }
     if (rc2 < 0) return n_kept > 0 ? n_kept : rc2;
+    /* A stashed fire and a fresh kernel fire can describe the same readiness:
+     * kqueue is level-triggered, so an fd we stashed as readable is still
+     * readable and the kernel reports it again in this very call. Handing the
+     * caller both copies makes it consume the readiness twice. Keep the
+     * stashed one (it is first in temporal order) and compact the duplicate
+     * out of the kernel's portion. */
+    if (n_kept > 0 && rc2 > 0) {
+        int w = 0;
+        for (int i = 0; i < rc2; i++) {
+            struct kevent64_s *ev = &eventlist[n_kept + i];
+            int dup = 0;
+            for (int j = 0; j < n_kept; j++) {
+                if (eventlist[j].ident == ev->ident &&
+                    eventlist[j].filter == ev->filter) { dup = 1; break; }
+            }
+            if (dup) {
+                tlog("WAIT-DROP-DUP kq=%d ident=%llu filter=%d flags=0x%x",
+                     kq, (unsigned long long)ev->ident, ev->filter, ev->flags);
+                continue;
+            }
+            eventlist[n_kept + w++] = *ev;
+        }
+        rc2 = w;
+    }
     int total = n_kept + rc2;
     machport_drain_fired(eventlist, total);
     return total;

@@ -77,7 +77,7 @@ those frameworks themselves.
 This group also absorbed the libSystem shims that used to live in a standalone
 `modern_api_polyfills.c` (built for the Claude Code / Bun port). They share the
 `src/mav_shim_debug.h` helper (runtime tracing via `MAV_PATCH_DEBUG=1`) and fall
-into two kinds:
+into three kinds:
 
 * **Gap-fillers** — provide a symbol 10.9 lacks entirely: `src/ulock.c`
   (`__ulock_wait{,2}`/`__ulock_wake`), `src/mkostemp.c`,
@@ -91,10 +91,20 @@ into two kinds:
   `connect` trace hooks), `src/dlopen_interpose.c` (rewrites `.node`
   add-ons' libSystem `LC_LOAD_DYLIB` to this wrapper), `src/write_underline.c`
   (cancels a 10.9 Terminal underline misparse), `src/ioctl_winsize.c`
-  (`TIOCGWINSZ` fd-0 fallback). Because these override existing symbols, a
+  (`TIOCGWINSZ` fd-0 fallback), `src/dnssd_process_result.c` (polls the
+  mDNSResponder socket before `DNSServiceProcessResult`'s blocking read, so a
+  readiness report with no message behind it cannot park the caller's event
+  loop). Because these override existing symbols, a
   consumer that plain-links the archive won't pull them (nothing is undefined);
   they activate only under `-force_load` (or the `system-lib` dylib), which is
   exactly how `libSystemWrapper` interposes them.
+* **Startup fixups** — export nothing; they run from a constructor and repair
+  the loaded image. `src/init_offsets.c` runs the main executable's
+  `__TEXT,__init_offsets` static constructors, which 10.9's dyld skips without a
+  diagnostic because it only understands the older `__DATA,__mod_init_func`
+  form, and registers the selectors in its `__objc_selrefs`. It runs at
+  constructor priority 65535 so the polyfills those constructors may call are
+  already live. Having no symbols to satisfy, it too needs `-force_load`.
 
 ## Building & installing
 
