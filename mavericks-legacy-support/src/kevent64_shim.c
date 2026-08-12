@@ -171,7 +171,11 @@ static void kq_invalidate_filter(int kq, uint64_t ident, int16_t filter) {
  * one wakeup port per loop; current Bun allocates exactly one async.
  * 32 slots leave headroom for future asyncs / multiple loops without
  * needing a hash table. Linear scan is trivial at this size. */
-#define MP_MAP_SIZE 32
+/* Sized for concurrency, not lifetime: entries are released as their one-shot
+ * fires (see mp_release_by_pset), so this only has to cover lookups in flight
+ * at the same instant. Bun issues ~5 per fetch and subagents can fetch in
+ * parallel, so leave generous headroom — an entry is 12 bytes. */
+#define MP_MAP_SIZE 128
 static struct {
     mach_port_t port;   /* original receive port Bun registered */
     mach_port_t pset;   /* portset we created to wrap it */
@@ -179,14 +183,84 @@ static struct {
 } g_mp_map[MP_MAP_SIZE];
 static pthread_mutex_t g_mp_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* Tear down one map slot: pull the port back out of our portset and drop the
+ * portset right. Caller must hold g_mp_mu. The port itself is untouched — we
+ * never owned it, and messages already queued on it stay queued (a portset
+ * routes notifications; it doesn't hold the messages). */
+static void mp_release_locked(int i) {
+    mach_port_t self = mach_task_self();
+    if (g_mp_map[i].port != MACH_PORT_NULL)
+        mach_port_move_member(self, g_mp_map[i].port, MACH_PORT_NULL);
+    if (g_mp_map[i].pset != MACH_PORT_NULL)
+        mach_port_mod_refs(self, g_mp_map[i].pset, MACH_PORT_RIGHT_PORT_SET, -1);
+    tlog("MACHPORT-RELEASE port=%u pset=%u no_drain=%d",
+         (unsigned)g_mp_map[i].port, (unsigned)g_mp_map[i].pset, g_mp_map[i].no_drain);
+    g_mp_map[i].port = MACH_PORT_NULL;
+    g_mp_map[i].pset = MACH_PORT_NULL;
+    g_mp_map[i].no_drain = 0;
+}
+
+/* True once the mapped name no longer names a live receive right — the owner
+ * destroyed it, so the cached portset is useless. */
+static int mp_port_dead(mach_port_t port) {
+    mach_port_type_t t = 0;
+    if (mach_port_type(mach_task_self(), port, &t) != KERN_SUCCESS) return 1;
+    return (t & MACH_PORT_TYPE_RECEIVE) == 0;
+}
+
+/* Mach port *names* are recycled. A name can therefore be live yet refer to a
+ * different port than the one we wrapped — in which case it is not a member of
+ * our portset and registering on that portset would never fire. Verifying
+ * membership is what makes a cache hit trustworthy. */
+static int mp_is_member(mach_port_t pset, mach_port_t port) {
+    mach_port_name_array_t members = NULL;
+    mach_msg_type_number_t count = 0;
+    if (mach_port_get_set_status(mach_task_self(), pset, &members, &count) != KERN_SUCCESS)
+        return 0;
+    int found = 0;
+    for (mach_msg_type_number_t i = 0; i < count; i++)
+        if (members[i] == port) { found = 1; break; }
+    if (members)
+        vm_deallocate(mach_task_self(), (vm_address_t)members,
+                      count * sizeof(*members));
+    return found;
+}
+
+/* Caller must hold g_mp_mu. Returns the slot index or -1. Releases the slot if
+ * the cached mapping has gone stale. */
+static int mp_find_valid_locked(mach_port_t port) {
+    for (int i = 0; i < MP_MAP_SIZE; i++) {
+        if (g_mp_map[i].port != port) continue;
+        if (mp_port_dead(port) || !mp_is_member(g_mp_map[i].pset, port)) {
+            mp_release_locked(i);
+            return -1;
+        }
+        return i;
+    }
+    return -1;
+}
+
 static mach_port_t mp_lookup_pset(mach_port_t port) {
     pthread_mutex_lock(&g_mp_mu);
-    mach_port_t r = MACH_PORT_NULL;
-    for (int i = 0; i < MP_MAP_SIZE; i++) {
-        if (g_mp_map[i].port == port) { r = g_mp_map[i].pset; break; }
-    }
+    int i = mp_find_valid_locked(port);
+    mach_port_t r = (i >= 0) ? g_mp_map[i].pset : MACH_PORT_NULL;
     pthread_mutex_unlock(&g_mp_mu);
     return r;
+}
+
+/* Drop the mapping for a fired one-shot. Bun registers getaddrinfo_async reply
+ * ports EV_ONESHOT, so once the event is delivered the kernel has already
+ * removed the filter and the mapping is dead weight. Reclaiming it here is what
+ * keeps the table from filling up: without it every DNS lookup permanently
+ * burned a slot (~5 per WebFetch), and once all MP_MAP_SIZE slots were gone
+ * every later registration went through unwrapped, was rejected by 10.9 with
+ * EV_ERROR, and the lookup hung forever. */
+static void mp_release_by_pset(mach_port_t pset) {
+    pthread_mutex_lock(&g_mp_mu);
+    for (int i = 0; i < MP_MAP_SIZE; i++) {
+        if (g_mp_map[i].pset == pset) { mp_release_locked(i); break; }
+    }
+    pthread_mutex_unlock(&g_mp_mu);
 }
 
 /* Given a receive-right port that Bun wants to register with
@@ -204,27 +278,46 @@ static mach_port_t mp_get_or_create_pset(mach_port_t port, int no_drain) {
     if (kr != KERN_SUCCESS) return MACH_PORT_NULL;
     kr = mach_port_move_member(self, port, pset);
     if (kr != KERN_SUCCESS) {
-        mach_port_deallocate(self, pset);
+        mach_port_mod_refs(self, pset, MACH_PORT_RIGHT_PORT_SET, -1);
         return MACH_PORT_NULL;
     }
 
     pthread_mutex_lock(&g_mp_mu);
     int slot = -1;
     for (int i = 0; i < MP_MAP_SIZE; i++) {
-        /* Someone else may have installed it while we were creating; prefer theirs. */
+        /* Someone else may have installed it while we were creating; prefer
+         * theirs. Hand the port back to their portset before dropping ours —
+         * our move_member above pulled it out of theirs. */
         if (g_mp_map[i].port == port) {
             mach_port_t other = g_mp_map[i].pset;
             pthread_mutex_unlock(&g_mp_mu);
-            mach_port_move_member(self, port, MACH_PORT_NULL);
-            mach_port_deallocate(self, pset);
+            mach_port_move_member(self, port, other);
+            mach_port_mod_refs(self, pset, MACH_PORT_RIGHT_PORT_SET, -1);
             return other;
         }
         if (slot < 0 && g_mp_map[i].port == MACH_PORT_NULL) slot = i;
     }
-    if (slot < 0) { /* table full — oh well */
+    /* Table full: reclaim slots whose mapping has gone stale (port destroyed,
+     * or its name recycled onto a port that is no longer a member). Normally
+     * one-shot entries are released as they fire, so this only matters for
+     * lookups that were cancelled before firing. */
+    if (slot < 0) {
+        for (int i = 0; i < MP_MAP_SIZE; i++) {
+            if (mp_port_dead(g_mp_map[i].port) ||
+                !mp_is_member(g_mp_map[i].pset, g_mp_map[i].port)) {
+                tlog("MACHPORT-GC slot=%d port=%u", i, (unsigned)g_mp_map[i].port);
+                mp_release_locked(i);
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) { /* still full — fall back to an unwrapped registration */
         pthread_mutex_unlock(&g_mp_mu);
+        tlog("MACHPORT-TABLE-FULL port=%u (registration will not be wrapped)",
+             (unsigned)port);
         mach_port_move_member(self, port, MACH_PORT_NULL);
-        mach_port_deallocate(self, pset);
+        mach_port_mod_refs(self, pset, MACH_PORT_RIGHT_PORT_SET, -1);
         return MACH_PORT_NULL;
     }
     g_mp_map[slot].port = port;
@@ -329,6 +422,14 @@ static void machport_drain_fired(struct kevent64_s *evs, int n) {
             evs[i].ident = original_port;
             tlog("MACHPORT-FIRE pset=%u -> port=%u no_drain=%d",
                  (unsigned)ident_port, (unsigned)original_port, no_drain);
+            /* no_drain entries are the bare EV_ONESHOT getaddrinfo_async reply
+             * ports: the kernel dropped the filter when it fired, so the
+             * mapping is spent. Release it now — the message stays queued on
+             * the port for getaddrinfo_async_handle_reply, and the slot goes
+             * back to the table instead of leaking for the process's lifetime.
+             * The `modern` wakeup-async ports are long-lived and re-fire, so
+             * their mappings must survive. */
+            if (no_drain) mp_release_by_pset(ident_port);
         }
     }
 }
