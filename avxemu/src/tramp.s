@@ -129,6 +129,176 @@ _avxemu_tt_resumeptr:   .quad 0                 // -> resume address (set per ru
 _avxemu_tt_record:                              // run_record bytes appended here per run
 _avxemu_tt_end:
 
+// ---- GPR-only thunk template ------------------------------------------------
+// Identical to the template above EXCEPT the vector spill saves only xmm0-15
+// (low 128 bits, legacy SSE movdqu) instead of all 16 ymm (256 bits). Used only
+// for runs whose every instruction is GPR-only (BMI/movbe/lzcnt/tzcnt): the C
+// emulation touches no vector register there, so the ONLY reason to preserve
+// vector state across the call is the System V ABI (xmm0-15 are caller-saved and
+// the SSE-only C emulation may clobber them). The upper 128 bits (ymmh) are not
+// touched by the -mno-avx C code, so they need no save/restore. Halves the
+// dominant per-run memory traffic (256-bit -> 128-bit, 32 moves either way).
+.align 4
+.globl _avxemu_ttg_start
+.globl _avxemu_ttg_dispatchptr
+.globl _avxemu_ttg_resumeptr
+.globl _avxemu_ttg_record
+.globl _avxemu_ttg_end
+_avxemu_ttg_start:
+    leaq    -FRAME(%rsp), %rsp
+    movq    %r11, RF_GPR+11*8(%rsp)
+    leaq    _avxemu_ttg_record(%rip), %r11
+    movq    %rax, RF_GPR+0*8(%rsp)
+    movq    %rcx, RF_GPR+1*8(%rsp)
+    movq    %rdx, RF_GPR+2*8(%rsp)
+    movq    %rbx, RF_GPR+3*8(%rsp)
+    leaq    FRAME(%rsp), %rax
+    movq    %rax, RF_GPR+4*8(%rsp)
+    movq    %rbp, RF_GPR+5*8(%rsp)
+    movq    %rsi, RF_GPR+6*8(%rsp)
+    movq    %rdi, RF_GPR+7*8(%rsp)
+    movq    %r8,  RF_GPR+8*8(%rsp)
+    movq    %r9,  RF_GPR+9*8(%rsp)
+    movq    %r10, RF_GPR+10*8(%rsp)
+    movq    %r12, RF_GPR+12*8(%rsp)
+    movq    %r13, RF_GPR+13*8(%rsp)
+    movq    %r14, RF_GPR+14*8(%rsp)
+    movq    %r15, RF_GPR+15*8(%rsp)
+    pushfq
+    popq    %rax
+    movq    %rax, RF_FLAGS(%rsp)
+    movdqu  %xmm0,  0*32(%rsp)
+    movdqu  %xmm1,  1*32(%rsp)
+    movdqu  %xmm2,  2*32(%rsp)
+    movdqu  %xmm3,  3*32(%rsp)
+    movdqu  %xmm4,  4*32(%rsp)
+    movdqu  %xmm5,  5*32(%rsp)
+    movdqu  %xmm6,  6*32(%rsp)
+    movdqu  %xmm7,  7*32(%rsp)
+    movdqu  %xmm8,  8*32(%rsp)
+    movdqu  %xmm9,  9*32(%rsp)
+    movdqu  %xmm10, 10*32(%rsp)
+    movdqu  %xmm11, 11*32(%rsp)
+    movdqu  %xmm12, 12*32(%rsp)
+    movdqu  %xmm13, 13*32(%rsp)
+    movdqu  %xmm14, 14*32(%rsp)
+    movdqu  %xmm15, 15*32(%rsp)
+    stmxcsr RF_MXCSR(%rsp)
+    movq    %rsp, %rbx
+    movq    %r11, %rdi
+    movq    %rbx, %rsi
+    andq    $-16, %rsp
+    call    *_avxemu_ttg_dispatchptr(%rip)
+    movq    %rbx, %rsp
+    ldmxcsr RF_MXCSR(%rsp)
+    movdqu  0*32(%rsp),  %xmm0
+    movdqu  1*32(%rsp),  %xmm1
+    movdqu  2*32(%rsp),  %xmm2
+    movdqu  3*32(%rsp),  %xmm3
+    movdqu  4*32(%rsp),  %xmm4
+    movdqu  5*32(%rsp),  %xmm5
+    movdqu  6*32(%rsp),  %xmm6
+    movdqu  7*32(%rsp),  %xmm7
+    movdqu  8*32(%rsp),  %xmm8
+    movdqu  9*32(%rsp),  %xmm9
+    movdqu  10*32(%rsp), %xmm10
+    movdqu  11*32(%rsp), %xmm11
+    movdqu  12*32(%rsp), %xmm12
+    movdqu  13*32(%rsp), %xmm13
+    movdqu  14*32(%rsp), %xmm14
+    movdqu  15*32(%rsp), %xmm15
+    movq    RF_GPR+0*8(%rbx),  %rax
+    movq    RF_GPR+1*8(%rbx),  %rcx
+    movq    RF_GPR+2*8(%rbx),  %rdx
+    movq    RF_GPR+5*8(%rbx),  %rbp
+    movq    RF_GPR+6*8(%rbx),  %rsi
+    movq    RF_GPR+7*8(%rbx),  %rdi
+    movq    RF_GPR+8*8(%rbx),  %r8
+    movq    RF_GPR+9*8(%rbx),  %r9
+    movq    RF_GPR+10*8(%rbx), %r10
+    movq    RF_GPR+11*8(%rbx), %r11
+    movq    RF_GPR+12*8(%rbx), %r12
+    movq    RF_GPR+13*8(%rbx), %r13
+    movq    RF_GPR+14*8(%rbx), %r14
+    movq    RF_GPR+15*8(%rbx), %r15
+    pushq   RF_FLAGS(%rbx)
+    popfq
+    leaq    FRAME(%rbx), %rsp
+    movq    RF_GPR+3*8(%rbx), %rbx
+    jmp     *_avxemu_ttg_resumeptr(%rip)
+.align 8
+_avxemu_ttg_dispatchptr: .quad 0
+_avxemu_ttg_resumeptr:   .quad 0
+_avxemu_ttg_record:
+_avxemu_ttg_end:
+
+// ---- BMI register-only thunk template (no vector save at all) ---------------
+// Used only for runs whose every instruction is a register-operand GPR-domain op
+// (is_bmi, no memory operand, no segment override). Its dispatch
+// (avxemu_tramp_dispatch_bmi) is xmm-CLEAN (verified: bmi_exec + the reg-only
+// emulate use no SSE), so the program's xmm/ymm are untouched across the call and
+// need NO save/restore. Saves only GPRs + rflags. Eliminates all 32 vector spills
+// and the mxcsr save -- the bulk of the per-run cost -- for the BMI hot path.
+.align 4
+.globl _avxemu_tt2_start
+.globl _avxemu_tt2_dispatchptr
+.globl _avxemu_tt2_resumeptr
+.globl _avxemu_tt2_record
+.globl _avxemu_tt2_end
+_avxemu_tt2_start:
+    leaq    -FRAME(%rsp), %rsp
+    movq    %r11, RF_GPR+11*8(%rsp)
+    leaq    _avxemu_tt2_record(%rip), %r11
+    movq    %rax, RF_GPR+0*8(%rsp)
+    movq    %rcx, RF_GPR+1*8(%rsp)
+    movq    %rdx, RF_GPR+2*8(%rsp)
+    movq    %rbx, RF_GPR+3*8(%rsp)
+    leaq    FRAME(%rsp), %rax
+    movq    %rax, RF_GPR+4*8(%rsp)
+    movq    %rbp, RF_GPR+5*8(%rsp)
+    movq    %rsi, RF_GPR+6*8(%rsp)
+    movq    %rdi, RF_GPR+7*8(%rsp)
+    movq    %r8,  RF_GPR+8*8(%rsp)
+    movq    %r9,  RF_GPR+9*8(%rsp)
+    movq    %r10, RF_GPR+10*8(%rsp)
+    movq    %r12, RF_GPR+12*8(%rsp)
+    movq    %r13, RF_GPR+13*8(%rsp)
+    movq    %r14, RF_GPR+14*8(%rsp)
+    movq    %r15, RF_GPR+15*8(%rsp)
+    pushfq
+    popq    %rax
+    movq    %rax, RF_FLAGS(%rsp)
+    movq    %rsp, %rbx
+    movq    %r11, %rdi
+    movq    %rbx, %rsi
+    andq    $-16, %rsp
+    call    *_avxemu_tt2_dispatchptr(%rip)
+    movq    %rbx, %rsp
+    movq    RF_GPR+0*8(%rbx),  %rax
+    movq    RF_GPR+1*8(%rbx),  %rcx
+    movq    RF_GPR+2*8(%rbx),  %rdx
+    movq    RF_GPR+5*8(%rbx),  %rbp
+    movq    RF_GPR+6*8(%rbx),  %rsi
+    movq    RF_GPR+7*8(%rbx),  %rdi
+    movq    RF_GPR+8*8(%rbx),  %r8
+    movq    RF_GPR+9*8(%rbx),  %r9
+    movq    RF_GPR+10*8(%rbx), %r10
+    movq    RF_GPR+11*8(%rbx), %r11
+    movq    RF_GPR+12*8(%rbx), %r12
+    movq    RF_GPR+13*8(%rbx), %r13
+    movq    RF_GPR+14*8(%rbx), %r14
+    movq    RF_GPR+15*8(%rbx), %r15
+    pushq   RF_FLAGS(%rbx)
+    popfq
+    leaq    FRAME(%rbx), %rsp
+    movq    RF_GPR+3*8(%rbx), %rbx
+    jmp     *_avxemu_tt2_resumeptr(%rip)
+.align 8
+_avxemu_tt2_dispatchptr: .quad 0
+_avxemu_tt2_resumeptr:   .quad 0
+_avxemu_tt2_record:
+_avxemu_tt2_end:
+
 // avxemu_run_on_stack(base, sz, fn, a, b): run fn(a,b) on the side stack
 // [base, base+sz). Keeps the heavy C emulation off the program stack. If rsp is
 // already inside that range (a nested call, e.g. a signal during emulation),

@@ -38,7 +38,7 @@ typedef struct {
 
     /* BMI/scalar */
     uint8_t is_bmi;
-    uint8_t opsize;      /* 32 or 64 */
+    uint8_t opsize;      /* 16 (66-prefixed lzcnt/tzcnt/movbe), 32 or 64 */
     int8_t  bmi_dst2;    /* MULX high-half dest register, else OPND_NONE */
     uint8_t bmi_s1_rdx;  /* MULX: src1 is implicit RDX */
 } decoded;

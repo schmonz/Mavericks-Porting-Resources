@@ -2,7 +2,7 @@
  * exec_bmi.c — BMI1/BMI2/LZCNT/TZCNT/MOVBE scalar emulation (GPR domain).
  *
  * Plain integer code; compiles anywhere. Operand order per op follows Intel
- * (see each case). opsize is 32 or 64; 32-bit results are zero-extended to 64
+ * (see each case). opsize is 16, 32 or 64; sub-64-bit results are zero-extended to 64
  * (writing a 32-bit GPR clears the upper half). Only architecturally *defined*
  * flags are produced; the differential oracle masks undefined flag bits.
  */

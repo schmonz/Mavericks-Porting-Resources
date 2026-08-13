@@ -18,10 +18,13 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <fcntl.h>       /* open() in faulthist_dump */
+#include <stdio.h>       /* rename() in faulthist_dump */
 #ifndef MAP_ANON
 #define MAP_ANON 0x1000   /* hidden under strict _XOPEN_SOURCE on macOS */
 #endif
 #include <mach/mach.h>
+#include <mach/mach_time.h>  /* mach_absolute_time() in faultsnap_dump */
 #include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
@@ -35,6 +38,130 @@
 
 static struct sigaction g_old;
 static int g_owned_sigill = 0;          /* our SIGILL handler is installed */
+
+/*
+ * Fault-driven relocation trigger (Task C). A 4-byte isolated scalar BMI op that
+ * the eager trampoliner couldn't patch (no room for a 5-byte jmp) keeps trapping
+ * forever at ~57us/round-trip. We count #UDs per RIP and, once a RIP crosses a
+ * threshold, relocate its block (avxemu_relocate_block) so it stops faulting. The
+ * table is a fixed open-addressed RIP->count map (no allocation in the handler).
+ */
+#define HOT_SLOTS 4096
+#define HOT_THRESHOLD 50          /* faults at one RIP before we relocate it */
+static struct { uint64_t rip; uint32_t n; } g_hot[HOT_SLOTS];
+static int g_reloc_enabled = 1;   /* AVXEMU_RELOC=0 disables (A/B) */
+
+/* AVXEMU_FAULTHIST=1 diagnostic: periodically dump the g_hot RIP->count table
+ * (i.e. every site still faulting into the handler) to /tmp/faulthist.out so a
+ * live spin can be probed for WHICH sites fault repeatedly (eager-scan misses,
+ * relocation declines, JIT-emitted code). Async-signal-safe: open/write/close
+ * + static buffers only, atomic rename like ophist. */
+static int g_faulthist_on = -1;
+static uint64_t g_faulthist_total;
+static int faulthist_enabled(void){
+    if (g_faulthist_on < 0){ const char *e = getenv("AVXEMU_FAULTHIST"); g_faulthist_on = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return g_faulthist_on;
+}
+static void fh_u64(int fd, uint64_t v){
+    char b[24]; int i = 24;
+    if (v == 0){ (void)write(fd, "0", 1); return; }
+    while (v){ b[--i] = (char)('0' + (v % 10)); v /= 10; }
+    (void)write(fd, b + i, (size_t)(24 - i));
+}
+static void fh_hex(int fd, uint64_t v){
+    char b[18]; int i = 18;
+    if (v == 0){ (void)write(fd, "0x0", 3); return; }
+    while (v){ int d = (int)(v & 0xF); b[--i] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v >>= 4; }
+    b[--i] = 'x'; b[--i] = '0';
+    (void)write(fd, b + i, (size_t)(18 - i));
+}
+/* AVXEMU_FAULTSNAP: register+string snapshot from inside the handler. */
+static int g_faultsnap_on = -1;
+static uint64_t g_faultsnap_total;
+static int faultsnap_enabled(void){
+    if (g_faultsnap_on < 0){ const char *e = getenv("AVXEMU_FAULTSNAP"); g_faultsnap_on = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return g_faultsnap_on;
+}
+static uint64_t *gpr_ptr(_STRUCT_X86_THREAD_STATE64 *ss, int i);   /* defined below */
+static void faultsnap_dump(uint64_t rip, _STRUCT_X86_THREAD_STATE64 *ss){
+    int fd = open("/tmp/faultsnap.out", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    /* seq + monotonic time in the header so recurrence ACROSS the run is measurable */
+    (void)write(fd, "--- snap ", 9); fh_u64(fd, g_faultsnap_total);
+    (void)write(fd, " t ", 3); fh_u64(fd, mach_absolute_time());
+    (void)write(fd, " rip ", 5); fh_hex(fd, rip); (void)write(fd, "\n", 1);
+    for (int i = 0; i < 16; i++){
+        uint64_t v = *gpr_ptr(ss, i);
+        (void)write(fd, "r", 1); fh_u64(fd, (uint64_t)i); (void)write(fd, "=", 1); fh_hex(fd, v);
+        /* plausible user pointer? try a guarded read and print printable runs */
+        if (v >= 0x100000000ull && v < 0x800000000000ull){
+            uint8_t buf[128]; mach_vm_size_t got = 0;
+            if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(v & ~0xFull),
+                                       sizeof buf, (mach_vm_address_t)(uintptr_t)buf, &got) == KERN_SUCCESS && got == sizeof buf){
+                int run = 0;
+                for (int k = 0; k <= (int)sizeof buf; k++){
+                    int printable = k < (int)sizeof buf && buf[k] >= 0x20 && buf[k] < 0x7F;
+                    if (printable) run++;
+                    else {
+                        if (run >= 6){ (void)write(fd, " \"", 2); (void)write(fd, buf + k - run, (size_t)run); (void)write(fd, "\"", 1); }
+                        run = 0;
+                    }
+                }
+            }
+        }
+        (void)write(fd, "\n", 1);
+    }
+    close(fd);
+}
+
+/* declined-relocation log: (rip, reason) recorded once per site when hot_bump
+ * fires and avxemu_relocate_block returns 0. Reasons (reloc.c RELOC_DECLINE):
+ * 1=pool-init 2=decode 3=not-faulting 4=window 5=patch-safety 6=pool-alloc
+ * 7=rel32-range 8=site-write */
+extern int avxemu_reloc_last_reason;
+static struct { uint64_t rip; int reason; } g_declined[512];
+static int g_ndeclined;
+static void declined_log(uint64_t rip, int reason){
+    if (g_ndeclined < (int)(sizeof g_declined / sizeof g_declined[0]))
+        { g_declined[g_ndeclined].rip = rip; g_declined[g_ndeclined].reason = reason; g_ndeclined++; }
+}
+static void faulthist_dump(void){
+    int fd = open("/tmp/faulthist.out.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    static const char hdr[] = "=== AVXEMU_FAULTHIST: still-faulting RIPs (count desc, top 48) ===\n";
+    (void)write(fd, hdr, sizeof hdr - 1);
+    /* top-48 selection over the fixed table; O(48*4096) compares, diagnostic-only */
+    uint64_t seen_max = ~0ull; uint32_t seen_n = ~0u;
+    for (int rank = 0; rank < 48; rank++){
+        uint32_t bn = 0; uint64_t brip = 0;
+        for (int k = 0; k < HOT_SLOTS; k++){
+            uint32_t n = g_hot[k].n; uint64_t r = g_hot[k].rip;
+            if (!r || n > seen_n || (n == seen_n && r >= seen_max)) continue;
+            if (n > bn || (n == bn && r > brip)){ bn = n; brip = r; }
+        }
+        if (!brip) break;
+        fh_hex(fd, brip); (void)write(fd, "\t", 1); fh_u64(fd, bn); (void)write(fd, "\n", 1);
+        seen_n = bn; seen_max = brip;
+    }
+    (void)write(fd, "TOTAL_FAULTS\t", 13); fh_u64(fd, g_faulthist_total); (void)write(fd, "\n", 1);
+    static const char dh[] = "=== relocation DECLINES (rip, reason: 1=pool-init 2=decode 3=not-faulting 4=window 5=patch-safety 6=pool-alloc 7=rel32 8=site-write) ===\n";
+    (void)write(fd, dh, sizeof dh - 1);
+    for (int i = 0; i < g_ndeclined; i++){
+        fh_hex(fd, g_declined[i].rip); (void)write(fd, "\tR", 2);
+        fh_u64(fd, (uint64_t)g_declined[i].reason); (void)write(fd, "\n", 1);
+    }
+    close(fd);
+    (void)rename("/tmp/faulthist.out.tmp", "/tmp/faulthist.out");
+}
+static int hot_bump(uint64_t rip) {     /* returns 1 exactly when count crosses threshold */
+    uint32_t i = (uint32_t)((rip * 0x9e3779b97f4a7c15ull) >> 52) & (HOT_SLOTS - 1);
+    for (int probe = 0; probe < 8; probe++) {
+        uint32_t k = (i + probe) & (HOT_SLOTS - 1);
+        if (g_hot[k].rip == rip) return ++g_hot[k].n == HOT_THRESHOLD;
+        if (g_hot[k].rip == 0)   { g_hot[k].rip = rip; g_hot[k].n = 1; return HOT_THRESHOLD == 1; }
+    }
+    return 0;
+}
 
 /*
  * The genuine libc sigaction. dlsym is unusable: dyld applies our own
@@ -262,7 +389,11 @@ int avxemu_emulate(const decoded *d, avxemu_regfile *rf) {
         if (d->dst_kind == DST_MEM) {
             uint64_t a = ea_rf(d, rf, rip_next); MEMWR(a, &dst, d->mem_bytes);
         } else {
-            if (d->dst >= 0)      rf->gpr[d->dst]      = dst;
+            /* 16-bit ops (66-prefixed lzcnt/tzcnt/movbe) write only the low word
+             * of the dst register on real hardware; 32/64-bit writes zero-extend. */
+            if (d->dst >= 0)      rf->gpr[d->dst] = (d->opsize == 16)
+                                      ? ((rf->gpr[d->dst] & ~0xFFFFull) | (dst & 0xFFFFull))
+                                      : dst;
             if (d->bmi_dst2 >= 0) rf->gpr[d->bmi_dst2] = dst2;
             rf->rflags = flags;
         }
@@ -310,6 +441,13 @@ int avxemu_emulate(const decoded *d, avxemu_regfile *rf) {
     if (!vec_exec(d->op, d->type, &A, &B, &C, d->imm, &OUT, &gpr_out)) return 0;
 
     if (d->dst_kind == DST_GPR) {
+        /* VPMOVMSKB r32, xmm (VEX.128) yields a 16-bit mask with the upper bits
+         * zeroed; vec_exec always packs 32 bits (lo | hi<<16), where the hi half
+         * is the stale upper 128 of the source ymm. Drop it for the 128-bit form
+         * (same upper-zeroing the vector-dst path does when !wide). Without this,
+         * scan loops (vpcmpeqb; vpmovmskb; bsf/test) see phantom high bits and
+         * never terminate — the same failure family as the 16-bit lzcnt bug. */
+        if (d->op == VPMOVMSKB && !d->wide) gpr_out &= 0xFFFFu;
         rf->gpr[d->dst] = gpr_out;
     } else if (d->dst_kind == DST_MEM) {
         uint64_t a = ea_rf(d, rf, rip_next); MEMWR(a, OUT.b, d->mem_bytes);
@@ -329,8 +467,16 @@ static void chain(int sig, siginfo_t *info, void *uctx) {
     } else if (g_old.sa_handler && g_old.sa_handler != SIG_DFL) {
         g_old.sa_handler(sig); return;
     }
-    /* default: restore and re-raise so the genuine fault crashes as expected */
-    signal(sig, SIG_DFL);
+    /* default: restore the genuine default disposition and re-raise so an
+     * instruction we don't emulate surfaces as a real #UD. This MUST go through
+     * the real sigaction, not our interposed signal()/sigaction: for an owned
+     * SIGILL those only record a new chain target and leave on_sigill frontline,
+     * so signal(sig, SIG_DFL); raise(sig); would re-enter this handler forever
+     * (an infinite SIGILL loop — observed as a hang on any unimplemented insn,
+     * e.g. AVX2 gathers). Mirrors the on_crash chain path. */
+    struct sigaction da; memset(&da, 0, sizeof da);
+    da.sa_handler = SIG_DFL; sigemptyset(&da.sa_mask);
+    real_sigaction()(sig, &da, 0);
     raise(sig);
 }
 
@@ -434,6 +580,54 @@ static void on_sigill(int sig, siginfo_t *info, void *uctx) {
     if (!decode(bp, &d)) { chain(sig, info, uctx); return; }   /* genuine #UD: let it surface */
     uint64_t rip_next = base + d.len;
 
+    /* AVXEMU_FAULTHIST diagnostic: snapshot the still-faulting-RIP table periodically */
+    if (faulthist_enabled() && ((++g_faulthist_total & 0x7FFF) == 0)) faulthist_dump();
+
+    /* AVXEMU_FAULTSNAP diagnostic: every 1024th fault, dump rip + GPRs and any
+     * printable string data the pointer-looking registers reach (vm_read-guarded,
+     * in-process — works where a debugger can't attach through the fault stream).
+     * Identifies WHAT data the hot loop is chewing on. */
+    if (faultsnap_enabled() && ((++g_faultsnap_total & 0x3FF) == 0))
+        faultsnap_dump(base, ss);
+
+    /*
+     * Fault-driven relocation — relocate BEFORE emulate. Once `base` has trapped
+     * HOT_THRESHOLD times, overwrite [base, base+5) with a `jmp rel32` into a
+     * relocated block that runs the op (natively/emulated) and jumps back.
+     *
+     * Why re-enter at `base` (not rip_next): the jmp we just wrote lives AT base
+     * and MUST execute. Advancing RIP would skip it; worse, for a 4-byte faulting
+     * op rip_next = base+4 lands on the LAST byte of the 5-byte E9 jmp, so the
+     * kernel would resume one byte INSIDE the jmp and decode garbage (a
+     * deterministic crash on the 50th hit of every such site). Re-entering at base
+     * runs the op exactly once, via the patched jmp.
+     *
+     * Why relocate-before-emulate (not emulate -> write back -> rip=base): that
+     * naive ordering DOUBLE-APPLIES dst==src ops. E.g. `tzcnt eax,eax`: emulate
+     * sets eax=f(eax_orig), then re-entering the relocated block computes
+     * f(f(eax_orig)). By relocating first and NOT emulating on success, the op
+     * runs exactly once.
+     *
+     * avxemu_relocate_block reads only the instruction bytes at base (it
+     * re-decodes and emits code); it never needs the emulated result, so calling
+     * it before emulation is correct. If it declines (unsafe site, non-relocatable
+     * op, or pool exhausted) we fall through and emulate this instance normally — a
+     * declined site keeps faulting + emulating forever (the safe floor).
+     *
+     * Gating matches the old post-write-back trigger, just moved earlier: reached
+     * only on the normal emulated path (the cpuid trap and every unrecognised-#UD
+     * chain() return earlier), using the real faulting address `base`. hot_bump
+     * fires once per site.
+     */
+    if (g_reloc_enabled && hot_bump(base)) {
+        if (avxemu_relocate_block((uint8_t *)base)) {
+            ss->__rip = (uint64_t)base;   /* re-enter: the patched jmp runs the op once */
+            return;
+        }
+        /* relocation declined -> fall through and emulate this instance normally */
+        if (faulthist_enabled()) declined_log(base, avxemu_reloc_last_reason);
+    }
+
     /* Snapshot the signal's machine state into a register-file, run the shared
      * core, and write the (possibly modified) state back. The same core runs
      * from the trampoline path, so there is exactly one emulation code path. */
@@ -514,6 +708,10 @@ static void avxemu_install(void) {
         return;
     }
     g_owned_sigill = 1;
+
+    /* Fault-driven relocation is on by default; AVXEMU_RELOC=0 disables it so the
+     * A/B harness can compare emulate-only vs relocate. */
+    { const char *r = getenv("AVXEMU_RELOC"); if (r) g_reloc_enabled = (r[0] != '0'); }
 
     /* Advertise AVX2 + BMI1/BMI2 through a trapped cpuid so the target program
      * takes its AVX2 code path (whose faulting instructions we emulate) rather

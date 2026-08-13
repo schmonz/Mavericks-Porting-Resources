@@ -21,7 +21,7 @@ quiet() { grep -vE "warning:|note:|implicitly declaring|please include|^ *\^|^ *
 
 echo "[1] compiling runtime core (SSE-only)..."
 PURE=""                      # the emulator's hot path — must be VEX-free
-for f in exec exec_bmi softfma names decode lde patch_mem tramp handler; do
+for f in exec exec_bmi softfma names decode lde patch_mem tramp reloc handler; do
     "$CC" $CORE -c src/$f.c -o "$OUT/$f.o" 2>&1 | quiet
     PURE="$PURE $OUT/$f.o"
 done
@@ -77,6 +77,32 @@ echo "[6e] SIMD over-read across an unmapped page (page-safe vector load)..."
 "$CC" $CORE -c test/overread.c -o "$OUT/overread.o" 2>&1 | quiet
 "$CC" $CORE "$OUT/overread.o" $PURE $ASM -o "$OUT/overread"
 "$OUT/overread" | tail -1
+
+echo "[6f] block-window relocation: round-trip emulate + verbatim + jmp-back..."
+"$CC" $CORE -c test/reloctest.c -o "$OUT/reloctest.o" 2>&1 | quiet
+"$CC" $CORE "$OUT/reloctest.o" $PURE $ASM -o "$OUT/reloctest"
+# Unit test of avxemu_relocate_block in isolation: AVXEMU_FORCETRAMP makes the
+# BMI op classify as faulting; AVXEMU_DISABLE keeps the load-time constructor
+# (cpuid/lzcnt patch + trampoline install) out of this hermetic test — the
+# relocation path needs no SIGILL handler. No `| tail`, so a failure (set -e)
+# stops the build instead of being masked.
+AVXEMU_DISABLE=1 AVXEMU_FORCETRAMP=1 "$OUT/reloctest"
+
+echo "[6g] native-SSE codegen thunk: emitted block vs C emulate (differential oracle)..."
+"$CC" $CORE -c test/nativetest.c -o "$OUT/nativetest.o" 2>&1 | quiet
+"$CC" $CORE "$OUT/nativetest.o" $PURE $ASM -o "$OUT/nativetest"
+# Hermetic: the emitter and C emulator both consume `decoded` structs; no VEX is
+# executed. AVXEMU_DISABLE keeps the load-time constructor out (the test inits the
+# pool itself). No `| tail`, so a mismatch (set -e) stops the build.
+AVXEMU_DISABLE=1 "$OUT/nativetest"
+
+echo "[6h] 16-bit (66-prefixed) lzcnt/tzcnt decode+emulate (the JSC-search spin bug)..."
+"$CC" -O2 -std=c11 -Isrc test/zcnt16.c "$OUT/decode.o" "$OUT/exec_bmi.o" "$OUT/names.o" -o "$OUT/zcnt16" 2>&1 | quiet
+# Hermetic: real instruction bytes -> production decode() -> bmi_exec, checked
+# against hand-computed hardware truth. Pins the 66-prefix opsize fix (a 16-bit
+# lzcnt mis-decoded as 32-bit returned +16-skewed counts -> app-level infinite
+# loop). No `| tail`, so a failure (set -e) stops the build.
+"$OUT/zcnt16" | tail -1
 
 echo "[7] decoder + differential fuzzer vs the real Claude binary (if present)..."
 BINARY="${CLAUDE_BIN:-$HOME/.local/share/claude/versions/2.1.166}"
